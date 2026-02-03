@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!--
+    Fixed wrist camera mount frame.
+    Adds:
+      - link:  wrist_cam_frame
+      - joint: tool0 -> wrist_cam_frame (fixed)
+  -->
+
+  <xacro:macro name="add_wrist_cam_mount"
+               params="parent_frame:='tool0'
+                       child_frame:='wrist_cam_frame'
+                       xyz:='-0.04 0.09 0.03'
+                       rpy:='-0.5235987756 0.0 3.1415926536'">
+
+    <link name="${child_frame}"/>
+
+    <joint name="${child_frame}_joint" type="fixed">
+      <parent link="${parent_frame}"/>
+      <child link="${child_frame}"/>
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+    </joint>
+
+  </xacro:macro>
+
+</robot>
+

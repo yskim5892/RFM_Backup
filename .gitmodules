@@ -1,0 +1,9 @@
+[submodule "thirdparty/Cutie"]
+	path = thirdparty/Cutie
+	url = https://github.com/yskim5892/Cutie
+[submodule "thirdparty/FoundationPose"]
+	path = thirdparty/FoundationPose
+	url = https://github.com/NVlabs/FoundationPose
+[submodule "thirdparty/Grounded-Segment-Anything"]
+	path = thirdparty/Grounded-Segment-Anything
+	url = https://github.com/IDEA-Research/Grounded-Segment-Anything

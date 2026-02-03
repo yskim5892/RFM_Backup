@@ -1,0 +1,7 @@
+# NumPy 2.x ABI 문제 방지
+numpy<2
+
+# OpenCV 4.13+가 numpy>=2를 요구하는 문제 방지
+opencv-python<4.13
+opencv-python-headless<4.13
+
