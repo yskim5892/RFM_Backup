@@ -35,7 +35,17 @@ tmux send-keys  -t "$SESSION:gsam_cutie" \
 
 tmux new-window -t "$SESSION" -n "static_tf"
 tmux send-keys  -t "$SESSION:static_tf" \
-  "$COMMON_SETUP ros2 run tf2_ros static_transform_publisher -0.04 0.09 0.03 0 -0.25881905 0.96592583 0 tool0 camera_color_optical_frame" C-m
+  "$COMMON_SETUP python publish_static_tf.py 0 1 0 -0.04 -0.5 0 0.866 0.09 0.866 0 0.5 0.03 0 0 0 1" C-m
+
+tmux new-window -t "$SESSION" -n "foundation_pose"
+tmux send-keys -t "SESSION:foundation_pose" \
+  "$COMMON_SETUP python pose_tracker_action_node.py --ros-args \
+  -r __ns:=/pose_tracker \
+  -r /pose_tracker/tf:=/tf \
+  -r /pose_tracker/tf_static:=/tf_static \
+  -p foundationpose_root:=/home/bi_admin/RFM/thirdparty/FoundationPose \
+  -p mesh_file:=/home/bi_admin/RFM/ycb/013_apple/google_16k/textured.obj \
+  -p base_frame:=base_link" C-m
 
 tmux select-window -t "$SESSION:realsense"
 tmux attach -t "$SESSION"

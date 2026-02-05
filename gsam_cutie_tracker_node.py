@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 import os
 from pathlib import Path
+import threading
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image as PILImage
 from torchvision.ops import box_convert
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image as RosImage
 from std_msgs.msg import String as RosString
+from std_msgs.msg import Header as RosHeader
 from cv_bridge import CvBridge
 
 # GSAM = GroundingDINO + SAM
@@ -20,14 +23,14 @@ from groundingdino.util.inference import load_model, predict
 from groundingdino.datasets import transforms as T
 from segment_anything import sam_model_registry, SamPredictor
 
-# Cutie (사용법은 사용자 제공/README 방식 그대로)
 from cutie.inference.inference_core import InferenceCore
 from cutie.utils.get_default_model import get_default_model
 
 from utils import label_to_rgb
 
+
 # -------------------------
-# (2) GSAM 마스크 생성 함수들
+# GSAM 마스크 생성 함수
 # -------------------------
 def load_gsam(gd_config: str, gd_ckpt: str, sam_ckpt: str, device: str = "cuda"):
     dev = torch.device(device)
@@ -99,7 +102,7 @@ def gsam_make_mask(
 
 
 # -------------------------
-# (3) ROS2 노드: 첫 프레임 GSAM init → Cutie tracking → 15Hz publish
+# ROS2 노드: 첫 프레임 GSAM init → Cutie tracking → 15Hz publish
 # -------------------------
 class GSAMCutieTracker(Node):
     def __init__(self, args):
@@ -112,6 +115,8 @@ class GSAMCutieTracker(Node):
         self.declare_parameter("image_topic", "/wrist_cam/camera/color/image_raw")
         self.declare_parameter("mask_topic", "/perception/instance_mask")
         self.declare_parameter("init_mask_topic", "/perception/initial_mask")
+        self.declare_parameter("mask_vis_topic", "/perception/instance_mask_vis")
+        self.declare_parameter("init_mask_vis_topic", "/perception/initial_mask_vis")
         self.declare_parameter("prompt", "/task/prompt")
         self.declare_parameter("publish_rate", 15.0)
         self.declare_parameter("device", "cuda")
@@ -130,7 +135,10 @@ class GSAMCutieTracker(Node):
         self.image_topic = self.get_parameter("image_topic").value
         self.mask_topic = self.get_parameter("mask_topic").value
         self.init_mask_topic = self.get_parameter("init_mask_topic").value
+        self.mask_vis_topic = self.get_parameter("mask_vis_topic").value
+        self.init_mask_vis_topic = self.get_parameter("init_mask_vis_topic").value
         self.prompt_topic = self.get_parameter("prompt").value
+        self._img_lock = threading.Lock()
 
         device = self.get_parameter("device").value
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -144,8 +152,10 @@ class GSAMCutieTracker(Node):
         self.sub = self.create_subscription(
             RosImage, self.image_topic, self._on_image, qos_profile_sensor_data
         )
-        self.mask_pub = self.create_publisher(RosImage, self.mask_topic, 10)
-        self.init_mask_pub = self.create_publisher(RosImage, self.init_mask_topic, 10)
+        self.mask_pub = self.create_publisher(RosImage, self.mask_topic, 10)                      # 32C1
+        self.mask_vis_pub = self.create_publisher(RosImage, self.mask_vis_topic, 10)              # rgb8
+        self.init_mask_pub = self.create_publisher(RosImage, self.init_mask_topic, 10)            # 32C1
+        self.init_mask_vis_pub = self.create_publisher(RosImage, self.init_mask_vis_topic, 10)    # rgb8
 
         # 나중에 외부에서 publish 구현. 일단 자체적으로 prompt를 argument로 받아 스스로 topic을 업데이트
         self.prompt_pub = self.create_publisher(RosString, "/task/prompt", 10)
@@ -158,7 +168,8 @@ class GSAMCutieTracker(Node):
         self.last_bgr = None
         self.last_header = None
         self.last_stamp_key = None
-        self.last_mask = None  # uint8 0/255
+        self.last_mask_label = None
+        self.init_mask_label = None
 
         # load GSAM once
         gd_config = self.get_parameter("gd_config").value
@@ -180,10 +191,52 @@ class GSAMCutieTracker(Node):
         self.get_logger().info(
             f"sub: {self.image_topic}, pub: {self.mask_topic, self.init_mask_topic}, prompt: '{self.prompt_topic}', device: {self.dev}"
         )
+    @staticmethod
+    def _make_imgmsg_32sc1(label: np.ndarray, header) -> RosImage:
+        """label: (H,W) int32, encoding=32SC1"""
+        if label.dtype != np.int32:
+            label = label.astype(np.int32)
+        h, w = label.shape[:2]
+        msg = RosImage()
+        # IMPORTANT: stamp/frame_id must match the input image header.
+        # Do not assign the header object directly (avoid accidental stamp drift).
+        msg.header.stamp = header.stamp
+        msg.header.frame_id = header.frame_id
+        msg.height, msg.width = int(h), int(w)
+        msg.encoding = "32SC1"
+        msg.is_bigendian = False
+        msg.step = int(w * 4)  # int32 = 4 bytes
+        msg.data = label.tobytes()
+        return msg
+
+    @staticmethod
+    def _make_imgmsg_rgb8(rgb: np.ndarray, header) -> RosImage:
+        """rgb: (H,W,3) uint8, encoding=rgb8"""
+        if rgb.dtype != np.uint8:
+            rgb = rgb.astype(np.uint8)
+        h, w = rgb.shape[:2]
+        msg = RosImage()
+        # IMPORTANT: stamp/frame_id must match the input image header.
+        msg.header.stamp = header.stamp
+        msg.header.frame_id = header.frame_id
+        msg.height = int(h)
+        msg.width = int(w)
+        msg.encoding = "rgb8"
+        msg.is_bigendian = False
+        msg.step = int(w * 3)
+        msg.data = rgb.tobytes()
+        return msg
 
     def _on_image(self, msg: RosImage):
-        self.last_header = msg.header
-        self.last_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        # Copy header so that published mask messages can carry the *input image* stamp,
+        # independent of when this node actually publishes the mask.
+        hdr = RosHeader()
+        hdr.stamp = msg.header.stamp
+        hdr.frame_id = msg.header.frame_id
+        with self._img_lock:
+            self.last_header = hdr
+            self.last_bgr = bgr
 
     def _on_prompt(self, msg: RosString):
         self.prompt = msg.data
@@ -200,18 +253,20 @@ class GSAMCutieTracker(Node):
 
     @torch.inference_mode()
     def _on_timer(self):
-        if self.last_bgr is None or self.last_header is None:
-            return
+        with self._img_lock:
+            if self.last_bgr is None or self.last_header is None:
+                return
+            header = self.last_header
+            bgr = self.last_bgr.copy()
 
-        stamp = self.last_header.stamp
+        stamp = header.stamp
         stamp_key = (int(stamp.sec), int(stamp.nanosec))
 
         # 새 프레임이 없으면 마지막 마스크를 재-publish(주기 유지)
-        if stamp_key == self.last_stamp_key and self.last_mask is not None:
-            self._publish_mask(self.last_mask, self.last_header)
+        if stamp_key == self.last_stamp_key and self.last_mask_label is not None:
+            self._publish_label_and_vis(self.last_mask_label, header, self.mask_pub, self.mask_vis_pub)
             return
 
-        bgr = self.last_bgr
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         image_tensor = torch.from_numpy(rgb).to(self.dev).permute(2, 0, 1).contiguous().float() / 255.0
@@ -224,34 +279,47 @@ class GSAMCutieTracker(Node):
                     self.sam_predictor, self.dev, self.args.topk,
                     box_threshold=self.box_th, text_threshold=self.text_th,
                 )
-                self.init_mask_msg = self.bridge.cv2_to_imgmsg(label_to_rgb(init_mask), encoding='rgb8')
-                self.init_mask_pub.publish(self.init_mask_msg)
+                init_mask = init_mask.astype(np.int32)
+                self.init_mask_label = init_mask
+                self._publish_label_and_vis(self.init_mask_label, header, self.init_mask_pub, self.init_mask_vis_pub)
+
                 if init_mask.sum() == 0:
                     self.get_logger().warning("GSAM init mask is empty. (prompt/threshold 확인)")
                     self.last_stamp_key = stamp_key
                     return
 
-                init_mask = (init_mask > 0).astype(np.uint8) * 1 
                 init_mask_tensor = torch.from_numpy(init_mask).to(self.dev)
-
                 obj_ids = list(range(1, int(init_mask.max()) + 1))
+
                 output_prob = self.processor.step(image_tensor, init_mask_tensor, objects=obj_ids)
                 self.inited = True
             else:
                 output_prob = self.processor.step(image_tensor)
-                self.init_mask_pub.publish(self.init_mask_msg)
+                if self.init_mask_label is not None:
+                    self._publish_label_and_vis(self.init_mask_label, header,
+                                                self.init_mask_pub, self.init_mask_vis_pub)
 
             cutie_mask = self.processor.output_prob_to_mask(output_prob)  # (H,W), 0/1/...
-            cutie_mask_rgb = label_to_rgb(cutie_mask.detach().cpu().numpy().astype(np.int32))
+            cutie_mask_label = cutie_mask.detach().cpu().numpy().astype(np.int32)
 
         self.last_stamp_key = stamp_key
-        self.last_mask = cutie_mask_rgb
-        self._publish_mask(cutie_mask_rgb, self.last_header)
+        self.last_mask_label = cutie_mask_label
+        self._publish_label_and_vis(self.last_mask_label, header, self.mask_pub, self.mask_vis_pub)
+
 
     def _publish_mask(self, mask_bin_u8: np.ndarray, header):
         msg = self.bridge.cv2_to_imgmsg(mask_bin_u8, encoding="rgb8")
-        msg.header = header
+        # Keep stamp/frame_id aligned with the input image.
+        msg.header.stamp = header.stamp
+        msg.header.frame_id = header.frame_id
         self.mask_pub.publish(msg)
+
+    def _publish_label_and_vis(self, label: np.ndarray, header, pub_label, pub_vis: Optional[any] = None):
+        """Always publish label(32SC1). If pub_vis provided, also publish rgb8 visualization."""
+        pub_label.publish(self._make_imgmsg_32sc1(label, header))
+        if pub_vis is not None:
+            rgb = label_to_rgb(label.astype(np.int32))
+            pub_vis.publish(self._make_imgmsg_rgb8(rgb, header))
 
 
 def main():

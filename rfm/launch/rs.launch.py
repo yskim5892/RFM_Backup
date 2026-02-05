@@ -49,6 +49,9 @@ def launch_setup(context, *args, **kwargs):
                 "align_depth.enable": True,
                 "rgb_camera.profile": "640x480x15",
                 "depth_module.profile": "640x480x15",
+                #"hole_filling_filter.enable": True,
+                #"temporal_filter.enable": True,
+                #"spatial_filter.enable": True,
             }]
         ))
 
@@ -66,6 +69,9 @@ def launch_setup(context, *args, **kwargs):
                 "align_depth.enable": True,
                 "rgb_camera.profile": "640x480x15",
                 "depth_module.profile": "640x480x15",
+                #"hole_filling_filter.enable": True,
+                #"temporal_filter.enable": True,
+                #"spatial_filter.enable": True,
             }]
         ))
 
