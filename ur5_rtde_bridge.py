@@ -17,9 +17,9 @@ class UR5RTDEBridge(Node):
         super().__init__("ur5_rtde_bridge")
 
         self.robot_ip = self.declare_parameter("robot_ip", "192.168.0.43").value
-        self.speed = float(self.declare_parameter("speed", 0.2).value)
-        self.accel = float(self.declare_parameter("accel", 0.5).value)
-        self.tcp_frame = self.declare_parameter("tcp_frame", "base_link").value
+        self.speed = float(self.declare_parameter("speed", 0.1).value)
+        self.accel = float(self.declare_parameter("accel", 0.1).value)
+        self.tcp_frame = self.declare_parameter("tcp_frame", "base").value
         self.publish_rate_hz = float(self.declare_parameter("publish_rate_hz", 30.0).value)
 
         import rtde_control, rtde_receive
@@ -41,8 +41,6 @@ class UR5RTDEBridge(Node):
         self.sub_relation_target = self.create_subscription(
             PoseStamped, "/pose_tracker/goal_tcp_pose_r", self._on_relation_target, 10
         )
-
-
 
         # stop service
         self.srv_stop = self.create_service(Trigger, "stop", self._on_stop)
@@ -142,8 +140,7 @@ class UR5RTDEBridge(Node):
                 pose[4] -= rv[1]
                 pose[5] -= rv[2]
 
-
-                ok = self.rtde_c.moveL(pose, speed=0.2, acceleration=0.4)
+                ok = self.rtde_c.moveL(pose, speed=self.speed, acceleration=self.accel)
                 self.exec_status = "SUCCESS" if ok else "FAILED"
 
             except Exception:

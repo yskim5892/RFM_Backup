@@ -23,7 +23,7 @@ class UR5RTDEBridge(Node):
         self.robot_ip = self.declare_parameter("robot_ip", "192.168.0.43").value
         self.speed = float(self.declare_parameter("speed", 0.1).value)
         self.accel = float(self.declare_parameter("accel", 0.1).value)
-        self.tcp_frame = self.declare_parameter("tcp_frame", "base_link").value
+        self.tcp_frame = self.declare_parameter("tcp_frame", "base").value
         self.publish_rate_hz = float(self.declare_parameter("publish_rate_hz", 30.0).value)
 
         import rtde_control, rtde_receive
@@ -43,7 +43,7 @@ class UR5RTDEBridge(Node):
         )
 
         self.sub_relation_target = self.create_subscription(
-            PoseStamped, "/test/goal_tcp_pose", self._on_relation_target, 10
+            PoseStamped, "/test/goal_tcp_pose_r", self._on_relation_target, 10
         )
 
         # stop service
@@ -73,9 +73,9 @@ class UR5RTDEBridge(Node):
         if not line:
             return
 
-        parts = line.split()
+        parts = line.split(maxsplit=1)
         cmd = parts[0].lower()
-        arg = parts[1].lower() if len(parts) >= 2 else None
+        arg = parts[1].strip().lower() if len(parts) == 2 else None
 
         if cmd == "where":
             pose = self.rtde_r.getActualTCPPose()
@@ -97,34 +97,30 @@ class UR5RTDEBridge(Node):
             self.get_logger().info(f"SAVED '{arg}': {self.pose_db[arg]}")
             return
 
-        if cmd in ("go", "observe", "three"):
-            name = arg if cmd == "go" else cmd
-            if not name:
+        if cmd == "go":
+            if not arg:
                 self.get_logger().warn("Usage: go <name>")
                 return
-            self._go_saved_pose(name)
+            if arg not in self.pose_db:
+                self.get_logger().warn(f"No saved pose: '{arg}'. Use 'list' or 'save {arg}'.")
+                return
+            self._go_saved_pose(arg)
             return
 
-        self.get_logger().warn(f"Unknown command: {cmd}")
+        self.get_logger().warn("Unknown command. Supported: where, list, save <name>, go <name>")
 
-    def _go_saved_pose(self, name: str):
-        if name not in self.pose_db:
-            self.get_logger().warn(f"No saved pose: '{name}'. Use 'list' or 'save {name}'.")
-            return
 
+    def _start_motion(self, worker_fn, busy_msg: str = "Robot is moving. Try again after it stops."):
         with self.lock:
             if self.moving:
-                self.get_logger().warn("Robot is moving. Try again after it stops.")
+                self.get_logger().warn(busy_msg)
                 return
             self.moving = True
             self.exec_status = "MOVING"
 
-        target = list(self.pose_db[name])
-
-        def worker():
+        def runner():
             try:
-                self.get_logger().info(f"GO '{name}' -> {target}")
-                ok = self.rtde_c.moveL(target, self.speed, self.accel)
+                ok = bool(worker_fn())
                 self.exec_status = "SUCCESS" if ok else "FAILED"
             except Exception as e:
                 self.exec_status = "FAILED"
@@ -133,7 +129,24 @@ class UR5RTDEBridge(Node):
                 with self.lock:
                     self.moving = False
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=runner, daemon=True).start()
+
+    @staticmethod
+    def _pose_to_rtde_target(msg: PoseStamped):
+        p = msg.pose.position
+        q = msg.pose.orientation
+        R = quat_to_mat([q.x, q.y, q.z, q.w])
+        rv = mat_to_rotvec(R)
+        return [float(p.x), float(p.y), float(p.z), float(rv[0]), float(rv[1]), float(rv[2])]
+
+    def _go_saved_pose(self, name: str):
+        if name not in self.pose_db:
+            self.get_logger().warn(f"No saved pose: '{name}'. Use 'list' or 'save {name}'.")
+            return
+
+        target = list(self.pose_db[name])
+        self.get_logger().info(f"GO '{name}' -> {target}")
+        self._start_motion(lambda: self.rtde_c.moveL(target, self.speed, self.accel))
 
     def _load_pose_db(self):
         try:
@@ -193,74 +206,20 @@ class UR5RTDEBridge(Node):
         return resp
 
     def _on_target(self, msg: PoseStamped):
-        with self.lock:
-            if self.moving:
-                return
-            self.moving = True
-            self.exec_status = "MOVING"
-
-        # spawn thread so ROS callback doesn't block
-        def worker():
-            try:
-                p = msg.pose.position
-                q = msg.pose.orientation
-                R = quat_to_mat([q.x,q.y,q.z,q.w])
-                rv = mat_to_rotvec(R)
-                target = [float(p.x), float(p.y), float(p.z), float(rv[0]), float(rv[1]), float(rv[2])]
-                # 1-line UR motion (moveL)
-                ok = self.rtde_c.moveL(target, self.speed, self.accel)
-                self.exec_status = "SUCCESS" if ok else "FAILED"
-            except Exception:
-                self.exec_status = "FAILED"
-            finally:
-                with self.lock:
-                    self.moving = False
-
-        threading.Thread(target=worker, daemon=True).start()
+        target = self._pose_to_rtde_target(msg)
+        self._start_motion(lambda: self.rtde_c.moveL(target, self.speed, self.accel),
+                           busy_msg="Robot is moving. Ignore absolute target.")
 
     def _on_relation_target(self, msg: PoseStamped):
-        with self.lock:
-            if self.moving:
-                return
-            self.moving = True
-            self.exec_status = "MOVING"
+        delta = self._pose_to_rtde_target(msg)
 
-        # spawn thread so ROS callback doesn't block
         def worker():
-            try:     
-                p = msg.pose.position
-                q = msg.pose.orientation
-                R = quat_to_mat([q.x,q.y,q.z,q.w])
-                rv = mat_to_rotvec(R)
-                target = [float(p.x), float(p.y), float(p.z), float(rv[0]), float(rv[1]), float(rv[2])]
+            pose = self.rtde_r.getActualTCPPose()
+            for i in range(6):
+                pose[i] += delta[i]
+            return self.rtde_c.moveL(pose, speed=self.speed, acceleration=self.accel)
 
-                pose = self.rtde_r.getActualTCPPose()
-                print("current : ", pose)
-
-                
-                # x 방향으로 p만큼
-                pose[0] += p.x
-                pose[1] += p.y
-                pose[2] += p.z
-                pose[3] += rv[0]
-                pose[4] += rv[1]
-                pose[5] += rv[2]
-
-
-                ok = self.rtde_c.moveL(pose, speed=0.2, acceleration=0.4)
-                self.exec_status = "SUCCESS" if ok else "FAILED"
-
-            except Exception:
-                self.exec_status = "FAILED"
-            finally:
-                with self.lock:
-                    self.moving = False
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
-
-
+        self._start_motion(worker, busy_msg="Robot is moving. Ignore relative target.")
 
 def main():
     rclpy.init()

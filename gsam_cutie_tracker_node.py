@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 import threading
+import json
+import ast
 
 import cv2
 import numpy as np
@@ -117,7 +119,7 @@ class GSAMCutieTracker(Node):
         self.declare_parameter("init_mask_topic", "/perception/initial_mask")
         self.declare_parameter("mask_vis_topic", "/perception/instance_mask_vis")
         self.declare_parameter("init_mask_vis_topic", "/perception/initial_mask_vis")
-        self.declare_parameter("prompt", "/task/prompt")
+        self.declare_parameter("objects_to_track_topic", "/inference/objects_to_track")
         self.declare_parameter("publish_rate", 15.0)
         self.declare_parameter("device", "cuda")
         self.declare_parameter("box_threshold", 0.35)
@@ -137,7 +139,7 @@ class GSAMCutieTracker(Node):
         self.init_mask_topic = self.get_parameter("init_mask_topic").value
         self.mask_vis_topic = self.get_parameter("mask_vis_topic").value
         self.init_mask_vis_topic = self.get_parameter("init_mask_vis_topic").value
-        self.prompt_topic = self.get_parameter("prompt").value
+        self.objects_to_track_topic = self.get_parameter("objects_to_track_topic").value
         self._img_lock = threading.Lock()
 
         device = self.get_parameter("device").value
@@ -157,13 +159,11 @@ class GSAMCutieTracker(Node):
         self.init_mask_pub = self.create_publisher(RosImage, self.init_mask_topic, 10)            # 32C1
         self.init_mask_vis_pub = self.create_publisher(RosImage, self.init_mask_vis_topic, 10)    # rgb8
 
-        # 나중에 외부에서 publish 구현. 일단 자체적으로 prompt를 argument로 받아 스스로 topic을 업데이트
-        self.prompt_pub = self.create_publisher(RosString, "/task/prompt", 10)
-        self.prompt_sub = self.create_subscription(RosString, "/task/prompt", self._on_prompt, 10)
+        self.objects_to_track_sub = self.create_subscription(
+            RosString, self.objects_to_track_topic, self._on_objects_to_track, 10
+        )
 
-        self.prompt = args.prompt
-        if self.prompt:
-            self.prompt_pub.publish(RosString(data=self.prompt))
+        self.objects_to_track = self._parse_objects_to_track(args.objects_to_track)
 
         self.last_bgr = None
         self.last_header = None
@@ -189,8 +189,40 @@ class GSAMCutieTracker(Node):
         self.timer = self.create_timer(1.0 / max(hz, 1e-3), self._on_timer)
 
         self.get_logger().info(
-            f"sub: {self.image_topic}, pub: {self.mask_topic, self.init_mask_topic}, prompt: '{self.prompt_topic}', device: {self.dev}"
+            f"sub: {self.image_topic}, pub: {self.mask_topic, self.init_mask_topic}, "
+            f"objects_to_track_topic: '{self.objects_to_track_topic}', objects={self.objects_to_track}, device: {self.dev}"
         )
+
+    @staticmethod
+    def _parse_objects_to_track(raw_text: str) -> list[str]:
+        text = (raw_text or "").strip()
+        if not text:
+            return []
+
+        # 1) JSON list
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+
+        # 2) Python literal list
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+
+        # 3) comma or whitespace separated
+        if "," in text:
+            return [x.strip() for x in text.split(",") if x.strip()]
+        if " " in text:
+            return [x.strip() for x in text.split() if x.strip()]
+
+        # 4) single object string
+        return [text]
     @staticmethod
     def _make_imgmsg_32sc1(label: np.ndarray, header) -> RosImage:
         """label: (H,W) int32, encoding=32SC1"""
@@ -238,13 +270,15 @@ class GSAMCutieTracker(Node):
             self.last_header = hdr
             self.last_bgr = bgr
 
-    def _on_prompt(self, msg: RosString):
-        self.prompt = msg.data
+    def _on_objects_to_track(self, msg: RosString):
+        objs = self._parse_objects_to_track(msg.data)
+        self.objects_to_track = objs
+        self.get_logger().info(f"objects_to_track updated: {self.objects_to_track}")
         self.inited = False
         self.last_stamp_key = None
 
-        self.last_mask = None
-        self.init_mask_msg = None
+        self.last_mask_label = None
+        self.init_mask_label = None
 
         # 2) Cutie 메모리 완전 리셋: InferenceCore 재생성
         self.processor = InferenceCore(self.cutie, cfg=self.cutie.cfg)
@@ -274,17 +308,23 @@ class GSAMCutieTracker(Node):
         amp = (self.dev.type == "cuda")
         with torch.cuda.amp.autocast(enabled=amp):
             if not self.inited:
-                init_mask = gsam_make_mask(
-                    bgr, self.prompt, self.gd_model, self.gd_transform,
-                    self.sam_predictor, self.dev, self.args.topk,
-                    box_threshold=self.box_th, text_threshold=self.text_th,
-                )
+                if not self.objects_to_track:
+                    return
+
+                init_mask = np.zeros(rgb.shape[:2], dtype=np.int32)
+                for instance_id, obj_name in enumerate(self.objects_to_track, start=1):
+                    single_mask = gsam_make_mask(
+                        bgr, obj_name, self.gd_model, self.gd_transform,
+                        self.sam_predictor, self.dev, self.args.topk,
+                        box_threshold=self.box_th, text_threshold=self.text_th,
+                    )
+                    init_mask[single_mask > 0] = instance_id
                 init_mask = init_mask.astype(np.int32)
                 self.init_mask_label = init_mask
                 self._publish_label_and_vis(self.init_mask_label, header, self.init_mask_pub, self.init_mask_vis_pub)
 
                 if init_mask.sum() == 0:
-                    self.get_logger().warning("GSAM init mask is empty. (prompt/threshold 확인)")
+                    self.get_logger().warning("GSAM init mask is empty. (objects_to_track/threshold 확인)")
                     self.last_stamp_key = stamp_key
                     return
 
@@ -325,7 +365,12 @@ class GSAMCutieTracker(Node):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prompt", type=str, default="", help="initial prompt string")
+    parser.add_argument(
+        "--objects_to_track",
+        type=str,
+        default="",
+        help="objects to track; supports JSON/python list string, comma-separated, or single object",
+    )
     parser.add_argument("--topk", type=int, default=1, help="DINO topk initial box")
     args, _ = parser.parse_known_args()    
 
@@ -340,4 +385,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import traceback
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -34,10 +35,12 @@ class PoseTrackerFoundationPose(Node):
         self.busy = False
 
         # -------- params --------
+        repo_root = Path(__file__).resolve().parent
+        self.repo_root = repo_root
+
         self.foundationpose_root = self.declare_parameter(
-            "foundationpose_root", os.environ.get("FOUNDATIONPOSE_ROOT", "/workspace/FoundationPose")
+            "foundationpose_root", str(repo_root / "thirdparty" / "FoundationPose")
         ).value
-        self.mesh_file = self.declare_parameter("mesh_file", "").value  # required
         self.base_frame = self.declare_parameter("base_frame", "base").value
         self.camera_frame = self.declare_parameter("camera_frame", "camera_color_optical_frame").value  # empty -> use msg.header.frame_id
 
@@ -74,9 +77,8 @@ class PoseTrackerFoundationPose(Node):
         self.instance_mask_topic = self.declare_parameter(
             "instance_mask_topic", "/perception/instance_mask"
         ).value
-
-        if not self.mesh_file:
-            raise RuntimeError('mesh_file param is required (e.g. /path/to/textured.obj)')
+        self.prompt_topic = self.declare_parameter("prompt_topic", "/inference/prompt").value
+        self.initial_prompt = self.declare_parameter("prompt", "").value
 
         # -------- TF --------
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
@@ -91,6 +93,7 @@ class PoseTrackerFoundationPose(Node):
 
         # optional input: /pose_tracker/target_object_id
         self.sub_target_id = self.create_subscription(Int32, "target_object_id", self._on_target_id, 10)
+        self.sub_prompt = self.create_subscription(String, self.prompt_topic, self._on_prompt, 10)
 
         # service: /pose_tracker/reset
         self.srv_reset = self.create_service(Trigger, "reset", self._on_reset)
@@ -111,19 +114,17 @@ class PoseTrackerFoundationPose(Node):
 
         self.torch = torch
 
-        self.get_logger().info(f"Loading mesh: {self.mesh_file}")
-        self.mesh = trimesh.load(self.mesh_file)
-        self.mesh.vertices = self.mesh.vertices.astype(np.float64)
-        if hasattr(self.mesh, "vertex_normals") and self.mesh.vertex_normals is not None:
-            self.mesh.vertex_normals = self.mesh.vertex_normals.astype(np.float64)
+        self.trimesh = trimesh
 
         self.scorer = ScorePredictor()
         self.refiner = PoseRefinePredictor()
         self.glctx = dr.RasterizeCudaContext()
 
+        # Load Default Mesh 
+        self.mesh, model_normals = self._resolve_mesh_file('apple')
         self.foundation_pose = FoundationPose(
             model_pts=self.mesh.vertices,
-            model_normals=self.mesh.vertex_normals,
+            model_normals=model_normals,
             mesh=self.mesh,
             scorer=self.scorer,
             refiner=self.refiner,
@@ -131,6 +132,7 @@ class PoseTrackerFoundationPose(Node):
             debug=0,
             glctx=self.glctx,
         )
+        self.current_object_name = ""
 
         self.initialized = False
         self.current_status = "READY"
@@ -157,6 +159,79 @@ class PoseTrackerFoundationPose(Node):
             f"  Sub mask : {self.instance_mask_topic}\n"
             f"  Pub /pose_tracker/T_base_obj, /pose_tracker/T_cam_obj, /pose_tracker/goal_tcp_pose, /pose_tracker/status\n"
         )
+
+        if self.initial_prompt:
+            self._on_prompt(String(data=self.initial_prompt))
+
+    def _normalize_object_name(self, name: str) -> str:
+        return (name or "").strip().lower().replace(" ", "_")
+
+    def _resolve_mesh_file(self, object_name: str):
+        norm = self._normalize_object_name(object_name)
+        if not norm:
+            return None, None
+
+        ycb_root = self.repo_root / "ycb"
+        if not ycb_root.exists():
+            self.get_logger().error(f"ycb directory not found: {ycb_root}")
+            return None, None
+
+        pattern = f"*{norm}*"
+        matches = sorted(p for p in ycb_root.glob(pattern) if p.is_dir())
+        if not matches:
+            self.get_logger().error(f"No YCB directory matched object '{object_name}' under {ycb_root}")
+            return None, None
+
+        mesh_file = matches[0] / "google_16k" / "textured.obj"
+        if not mesh_file.exists():
+            self.get_logger().error(f"Mesh file not found: {mesh_file}")
+            return None, None
+
+        self.get_logger().info(f"Loading mesh for '{object_name}': {mesh_file}")
+        mesh = self.trimesh.load(str(mesh_file))
+        mesh.vertices = mesh.vertices.astype(np.float64)
+        if hasattr(mesh, "vertex_normals") and mesh.vertex_normals is not None:
+            mesh.vertex_normals = mesh.vertex_normals.astype(np.float64)
+
+        model_normals = mesh.vertex_normals if getattr(mesh, "vertex_normals", None) is not None else np.zeros_like(mesh.vertices)
+
+        return mesh, model_normals
+
+    def _reset_foundation_pose_object(self, object_name: str) -> bool:
+        mesh, model_normals = self._resolve_mesh_file(object_name)
+        if mesh is None:
+            return False
+
+        try:
+            self.foundation_pose.reset_object(
+                model_pts=mesh.vertices,
+                model_normals=model_normals,
+                symmetry_tfs=None,
+                mesh=mesh,
+            )
+            self.mesh = mesh
+            self.current_object_name = self._normalize_object_name(object_name)
+            self.initialized = False
+            self._set_status("READY")
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to reset FoundationPose mesh for '{object_name}': {e}")
+            return False
+
+    def _extract_object_from_prompt(self, prompt_text: str) -> Optional[str]:
+        parts = (prompt_text or "").strip().split()
+        if len(parts) < 2:
+            return None
+        return parts[1]
+
+    def _on_prompt(self, msg: String):
+        obj_name = self._extract_object_from_prompt(msg.data)
+        if obj_name is None:
+            self.get_logger().warning(f"Invalid prompt format: '{msg.data}'. Expected: '<verb> <object>'")
+            return
+        ok = self._reset_foundation_pose_object(obj_name)
+        if not ok:
+            self._set_status("ERROR")
 
     def _publish_status(self):
         msg = String()
@@ -379,6 +454,9 @@ class PoseTrackerFoundationPose(Node):
     def _on_synced(self, color_msg: Image, depth_msg: Image, mask_msg: Image):
         if self.K is None:
             return
+        if self.mesh is None:
+            self._set_status("READY")
+            return
 
         with self.lock:
             if self.busy:
@@ -537,6 +615,7 @@ class PoseTrackerFoundationPose(Node):
         return bad
 
 def main():
+    ros_args = sys.argv[:1] + ["--ros-args", "-r", "__ns:=/pose_tracker", "-r", "tf:=/tf", "-r", "tf_static:=/tf_static"]
     rclpy.init()
     node = PoseTrackerFoundationPose()
     try:
@@ -547,4 +626,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
