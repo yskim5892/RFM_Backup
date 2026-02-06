@@ -31,9 +31,6 @@ from cutie.utils.get_default_model import get_default_model
 from utils import label_to_rgb
 
 
-# -------------------------
-# GSAM 마스크 생성 함수
-# -------------------------
 def load_gsam(gd_config: str, gd_ckpt: str, sam_ckpt: str, device: str = "cuda"):
     dev = torch.device(device)
     gd_model = load_model(gd_config, gd_ckpt).to(dev).eval()
@@ -47,7 +44,6 @@ def load_gsam(gd_config: str, gd_ckpt: str, sam_ckpt: str, device: str = "cuda")
     sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt).to(dev).eval()
     sam_predictor = SamPredictor(sam)
     return gd_model, gd_transform, sam_predictor, dev
-
 
 @torch.inference_mode()
 def gsam_make_mask(
@@ -114,32 +110,18 @@ class GSAMCutieTracker(Node):
 
         here = Path(__file__).resolve().parent / "thirdparty" / "Grounded-Segment-Anything"
 
-        self.declare_parameter("image_topic", "/wrist_cam/camera/color/image_raw")
-        self.declare_parameter("mask_topic", "/perception/instance_mask")
-        self.declare_parameter("init_mask_topic", "/perception/initial_mask")
-        self.declare_parameter("mask_vis_topic", "/perception/instance_mask_vis")
-        self.declare_parameter("init_mask_vis_topic", "/perception/initial_mask_vis")
-        self.declare_parameter("objects_to_track_topic", "/inference/objects_to_track")
         self.declare_parameter("publish_rate", 15.0)
         self.declare_parameter("device", "cuda")
         self.declare_parameter("box_threshold", 0.35)
         self.declare_parameter("text_threshold", 0.25)
         self.declare_parameter("max_internal_size", 480)
-
-        # GSAM paths (이 파일을 Grounded-Segment-Anything 루트에 두면 기본값 OK)
-        self.declare_parameter(
-            "gd_config",
-            str(here / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"),
-        )
-        self.declare_parameter("gd_ckpt", str(here / "groundingdino_swint_ogc.pth"))
-        self.declare_parameter("sam_ckpt", str(here / "sam_vit_h_4b8939.pth"))
-
-        self.image_topic = self.get_parameter("image_topic").value
-        self.mask_topic = self.get_parameter("mask_topic").value
-        self.init_mask_topic = self.get_parameter("init_mask_topic").value
-        self.mask_vis_topic = self.get_parameter("mask_vis_topic").value
-        self.init_mask_vis_topic = self.get_parameter("init_mask_vis_topic").value
-        self.objects_to_track_topic = self.get_parameter("objects_to_track_topic").value
+        
+        self.image_topic = "/wrist_cam/camera/color/image_raw"
+        self.mask_topic = "/perception/instance_mask"
+        self.init_mask_topic = "/perception/initial_mask"
+        self.mask_vis_topic = "/perception/instance_mask_vis"
+        self.init_mask_vis_topic = "/perception/initial_mask_vis"
+        self.objects_to_track_topic = "/inference/objects_to_track"
         self._img_lock = threading.Lock()
 
         device = self.get_parameter("device").value
@@ -154,10 +136,12 @@ class GSAMCutieTracker(Node):
         self.sub = self.create_subscription(
             RosImage, self.image_topic, self._on_image, qos_profile_sensor_data
         )
-        self.mask_pub = self.create_publisher(RosImage, self.mask_topic, 10)                      # 32C1
-        self.mask_vis_pub = self.create_publisher(RosImage, self.mask_vis_topic, 10)              # rgb8
-        self.init_mask_pub = self.create_publisher(RosImage, self.init_mask_topic, 10)            # 32C1
-        self.init_mask_vis_pub = self.create_publisher(RosImage, self.init_mask_vis_topic, 10)    # rgb8
+        # Object Mask를 Node끼리 주고받을 때는 32C1 (one-hot map)
+        # Visualize할 때는 rgb8
+        self.mask_pub = self.create_publisher(RosImage, self.mask_topic, 10)            
+        self.mask_vis_pub = self.create_publisher(RosImage, self.mask_vis_topic, 10)      
+        self.init_mask_pub = self.create_publisher(RosImage, self.init_mask_topic, 10) 
+        self.init_mask_vis_pub = self.create_publisher(RosImage, self.init_mask_vis_topic, 10)   
 
         self.objects_to_track_sub = self.create_subscription(
             RosString, self.objects_to_track_topic, self._on_objects_to_track, 10
@@ -172,6 +156,9 @@ class GSAMCutieTracker(Node):
         self.init_mask_label = None
 
         # load GSAM once
+        self.declare_parameter("gd_config", str(here / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"))
+        self.declare_parameter("gd_ckpt", str(here / "groundingdino_swint_ogc.pth"))
+        self.declare_parameter("sam_ckpt", str(here / "sam_vit_h_4b8939.pth"))
         gd_config = self.get_parameter("gd_config").value
         gd_ckpt = self.get_parameter("gd_ckpt").value
         sam_ckpt = self.get_parameter("sam_ckpt").value
@@ -179,7 +166,7 @@ class GSAMCutieTracker(Node):
             gd_config, gd_ckpt, sam_ckpt, device=device
         )
 
-        # load Cutie once
+        # load Cutie
         self.cutie = get_default_model().to(self.dev)
         self.processor = InferenceCore(self.cutie, cfg=self.cutie.cfg)
         self.processor.max_internal_size = int(self.get_parameter("max_internal_size").value)
@@ -223,6 +210,7 @@ class GSAMCutieTracker(Node):
 
         # 4) single object string
         return [text]
+    
     @staticmethod
     def _make_imgmsg_32sc1(label: np.ndarray, header) -> RosImage:
         """label: (H,W) int32, encoding=32SC1"""
@@ -360,7 +348,6 @@ class GSAMCutieTracker(Node):
         if pub_vis is not None:
             rgb = label_to_rgb(label.astype(np.int32))
             pub_vis.publish(self._make_imgmsg_rgb8(rgb, header))
-
 
 def main():
     import argparse

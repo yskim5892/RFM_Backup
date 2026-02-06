@@ -38,13 +38,11 @@ class PoseTrackerFoundationPose(Node):
         repo_root = Path(__file__).resolve().parent
         self.repo_root = repo_root
 
-        self.foundationpose_root = self.declare_parameter(
-            "foundationpose_root", str(repo_root / "thirdparty" / "FoundationPose")
-        ).value
+        self.foundationpose_root =  str(repo_root / "thirdparty" / "FoundationPose")
         self.base_frame = self.declare_parameter("base_frame", "base").value
         self.camera_frame = self.declare_parameter("camera_frame", "camera_color_optical_frame").value  # empty -> use msg.header.frame_id
 
-        self.depth_scale = float(self.declare_parameter("depth_scale", 0.001).value)  # uint16(mm)->m
+        self.depth_scale = 0.001  # uint16(mm)->m
 
         self.target_object_id = int(self.declare_parameter("target_object_id", 0).value)  # 0 => auto(largest)
         self.min_mask_pixels = int(self.declare_parameter("min_mask_pixels", 200).value)
@@ -53,31 +51,11 @@ class PoseTrackerFoundationPose(Node):
         self.track_refine_iter = int(self.declare_parameter("track_refine_iter", 2).value)
 
         # TCP heuristic
-        self.pregrasp_height = float(self.declare_parameter("pregrasp_height", 0.10).value)  # meters above object
+        self.pregrasp_height = float(self.declare_parameter("pregrasp_height", 0.25).value)  # meters above object
 
-        self.publish_object_tf = bool(self.declare_parameter("publish_object_tf", True).value)
-        
-        # pose visualization (overlay on RGB)
-        self.publish_pose_vis = bool(self.declare_parameter("publish_pose_vis", True).value)
-        self.pose_vis_axis_len = float(self.declare_parameter("pose_vis_axis_len", 0.05).value)  # meters
-        self.pose_vis_thickness = int(self.declare_parameter("pose_vis_thickness", 3).value)
-        self.pose_vis_draw_contour = bool(self.declare_parameter("pose_vis_draw_contour", True).value)
-        self.pub_pose_vis = self.create_publisher(Image, "pose_vis", 10)
-
-        # topics (absolute defaults as spec)
-        self.color_topic = self.declare_parameter(
-            "color_topic", "/wrist_cam/camera/color/image_raw"
-        ).value
-        self.depth_topic = self.declare_parameter(
-            "depth_topic", "/wrist_cam/camera/aligned_depth_to_color/image_raw"
-        ).value
-        self.cam_info_topic = self.declare_parameter(
-            "camera_info_topic", "/wrist_cam/camera/color/camera_info"
-        ).value
-        self.instance_mask_topic = self.declare_parameter(
-            "instance_mask_topic", "/perception/instance_mask"
-        ).value
-        self.prompt_topic = self.declare_parameter("prompt_topic", "/inference/prompt").value
+        self.color_topic = "/wrist_cam/camera/color/image_raw"
+        self.depth_topic = "/wrist_cam/camera/aligned_depth_to_color/image_raw"
+        self.instance_mask_topic = "/perception/instance_mask"
         self.initial_prompt = self.declare_parameter("prompt", "").value
 
         # -------- TF --------
@@ -86,21 +64,22 @@ class PoseTrackerFoundationPose(Node):
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # -------- outputs (relative to /pose_tracker namespace) --------
-        self.pub_T_base_obj = self.create_publisher(PoseStamped, "T_base_obj", 10)
-        self.pub_T_cam_obj = self.create_publisher(PoseStamped, "T_cam_obj", 10)
-        self.pub_target_tcp = self.create_publisher(PoseStamped, "goal_tcp_pose", 10)
-        self.pub_status = self.create_publisher(String, "status", 10)
+        self.pub_T_base_obj = self.create_publisher(PoseStamped, "/pose_tracker/T_base_obj", 10)
+        self.pub_T_cam_obj = self.create_publisher(PoseStamped, "/pose_tracker/T_cam_obj", 10)
+        self.pub_target_tcp = self.create_publisher(PoseStamped, "/ur5/goal_tcp_pose", 10)
+        self.pub_pose_vis = self.create_publisher(Image, "/pose_tracker/pose_vis", 10)  # pose visualization (overlay on RGB)
+        self.pub_status = self.create_publisher(String, "/pose_tracker/status", 10)
 
         # optional input: /pose_tracker/target_object_id
-        self.sub_target_id = self.create_subscription(Int32, "target_object_id", self._on_target_id, 10)
-        self.sub_prompt = self.create_subscription(String, self.prompt_topic, self._on_prompt, 10)
+        self.sub_target_id = self.create_subscription(Int32, "/pose_tracker/target_object_id", self._on_target_id, 10)
+        self.sub_prompt = self.create_subscription(String, "/inferece/prompt", self._on_prompt, 10)
 
         # service: /pose_tracker/reset
-        self.srv_reset = self.create_service(Trigger, "reset", self._on_reset)
+        self.srv_reset = self.create_service(Trigger, "/pose_tracker/reset", self._on_reset)
 
         # -------- camera intrinsics --------
         self.K: Optional[np.ndarray] = None
-        self._cam_info_sub = self.create_subscription(CameraInfo, self.cam_info_topic, self._on_cam_info, 10)
+        self.sub_cam_info = self.create_subscription(CameraInfo, "/wrist_cam/camera/color/camera_info", self._on_cam_info, 10)
 
         # -------- FoundationPose init --------
         if self.foundationpose_root not in sys.path:
@@ -384,7 +363,7 @@ class PoseTrackerFoundationPose(Node):
         vis = rgb.copy()
 
         # draw contour (yellow)
-        if self.pose_vis_draw_contour and mask is not None:
+        if mask is not None:
             mask_u8 = (mask.astype(np.uint8) * 255)
             res = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours = res[0] if len(res) == 2 else res[1]
@@ -394,7 +373,7 @@ class PoseTrackerFoundationPose(Node):
         # axes
         R = T_cam_obj[:3, :3]
         t = T_cam_obj[:3, 3]
-        L = float(self.pose_vis_axis_len)
+        L = 0.05 # Visualized axis length (in real world scale, 단위 : m)
 
         pts_obj = np.array([
             [0.0, 0.0, 0.0],  # origin
@@ -410,7 +389,7 @@ class PoseTrackerFoundationPose(Node):
         py = self._project_uv(K, pts_cam[2])
         pz = self._project_uv(K, pts_cam[3])
 
-        th = int(self.pose_vis_thickness)
+        th = 3
         if p0 is not None:
             cv2.circle(vis, p0, max(2, th + 1), (255, 255, 255), -1)  # white
 
@@ -535,15 +514,15 @@ class PoseTrackerFoundationPose(Node):
             self._publish_pose(self.pub_T_cam_obj, cam_frame, color_msg.header.stamp, T_cam_obj)
 
             # optional TF object_<id>
-            if self.publish_object_tf:
-                self._broadcast_object_tf(obj_id, self.base_frame, color_msg.header.stamp, T_base_obj)
+            self._broadcast_object_tf(obj_id, self.base_frame, color_msg.header.stamp, T_base_obj)
 
-            T_base_tcp = self._compute_target_tcp_T(T_base_obj)
-            self._publish_pose(self.pub_target_tcp, self.base_frame, color_msg.header.stamp, T_base_tcp)
+            if not bad:
+                T_base_tcp = self._compute_target_tcp_T(T_base_obj)
+                self._publish_pose(self.pub_target_tcp, self.base_frame, color_msg.header.stamp, T_base_tcp)
 
-            if self.publish_pose_vis:
-                vis = self._make_pose_vis(rgb, mask, K, T_cam_obj)
-                self._publish_rgb8_image(self.pub_pose_vis, color_msg.header, vis)
+            # Visualize Estimated object 6d pos
+            vis = self._make_pose_vis(rgb, mask, K, T_cam_obj)
+            self._publish_rgb8_image(self.pub_pose_vis, color_msg.header, vis)
 
             self._set_status("RUNNING")
         except Exception as e:
@@ -615,7 +594,7 @@ class PoseTrackerFoundationPose(Node):
         return bad
 
 def main():
-    ros_args = sys.argv[:1] + ["--ros-args", "-r", "__ns:=/pose_tracker", "-r", "tf:=/tf", "-r", "tf_static:=/tf_static"]
+    ros_args = sys.argv[:1] + ["--ros-args", "-r", "tf:=/tf", "-r", "tf_static:=/tf_static"]
     rclpy.init()
     node = PoseTrackerFoundationPose()
     try:
