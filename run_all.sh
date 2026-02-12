@@ -1,52 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="/home/bi_admin/RFM"
 SESSION="rfm"
+ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
+ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
+RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 
-# 인자로 받은 prompt 옵션 전체를 그대로 사용
-# 예: --prompt apple
-PROMPT_ARGS="${*:-"--prompt apple"}"
-
-# 이미 세션이 있으면 안내 후 종료
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "[!] tmux session '$SESSION' already exists."
-  echo "    attach: tmux attach -t $SESSION"
-  echo "    kill  : tmux kill-session -t $SESSION"
+if [[ ! -f "$ROOT_DIR/rfm/install_humble/local_setup.bash" ]]; then
+  echo "Missing $ROOT_DIR/rfm/install_humble/local_setup.bash"
+  echo "Run first: source $ROOT_DIR/scripts/run_outside_humble.sh"
+  exit 1
+fi
+if [[ ! -f "$ROOT_DIR/rfm/install_foxy/local_setup.bash" ]]; then
+  echo "Missing $ROOT_DIR/rfm/install_foxy/local_setup.bash"
+  echo "Run once first: bash $ROOT_DIR/scripts/build_rfm_foxy_once.sh"
   exit 1
 fi
 
-COMMON_SETUP='
-set -e
-# source /opt/ros/humble/setup.bash
-# source ~/RFM/rfm/install/setup.bash
-'
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "tmux session '$SESSION' already exists."
+  echo "attach: tmux attach -t $SESSION"
+  echo "kill  : tmux kill-session -t $SESSION"
+  exit 1
+fi
+
+COMMON="source /opt/ros/humble/setup.bash && source $ROOT_DIR/rfm/install_humble/local_setup.bash && cd $ROOT_DIR"
 
 tmux new-session -d -s "$SESSION" -n "realsense"
-tmux send-keys  -t "$SESSION:realsense" \
-  "$COMMON_SETUP ros2 launch rfm rs.launch.py wrist_cam:=true" C-m
+tmux send-keys -t "$SESSION:realsense" \
+  "export ROS_DOMAIN_ID=$ROS_DOMAIN_ID ROS_LOCALHOST_ONLY=$ROS_LOCALHOST_ONLY RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION && $COMMON && ros2 launch $ROOT_DIR/rfm/launch/rs.launch.py wrist_cam:=true" C-m
 
 tmux new-window -t "$SESSION" -n "ur_driver"
-tmux send-keys  -t "$SESSION:ur_driver" \
-  "$COMMON_SETUP ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.43 launch_rviz:=false" C-m
+tmux send-keys -t "$SESSION:ur_driver" \
+  "export ROS_DOMAIN_ID=$ROS_DOMAIN_ID ROS_LOCALHOST_ONLY=$ROS_LOCALHOST_ONLY RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION && $COMMON && ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.43 launch_rviz:=false" C-m
 
-tmux new-window -t "$SESSION" -n "gsam_cutie"
-tmux send-keys  -t "$SESSION:gsam_cutie" \
-  "$COMMON_SETUP python gsam_cutie_tracker_node.py ${PROMPT_ARGS}" C-m
+tmux new-window -t "$SESSION" -n "ur5_bridge"
+tmux send-keys -t "$SESSION:ur5_bridge" \
+  "export ROS_DOMAIN_ID=$ROS_DOMAIN_ID ROS_LOCALHOST_ONLY=$ROS_LOCALHOST_ONLY RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION && $COMMON && python ur5_bridge.py --node_name ur5" C-m
 
-tmux new-window -t "$SESSION" -n "static_tf"
-tmux send-keys  -t "$SESSION:static_tf" \
-  "$COMMON_SETUP python publish_static_tf.py 0 1 0 -0.04 -0.5 0 0.866 0.09 0.866 0 0.5 0.03 0 0 0 1" C-m
+tmux new-window -t "$SESSION" -n "gsam"
+tmux send-keys -t "$SESSION:gsam" \
+  "export ROS_DOMAIN_ID=$ROS_DOMAIN_ID ROS_LOCALHOST_ONLY=$ROS_LOCALHOST_ONLY RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION && $COMMON && echo '[gsam] example commands:' && echo \"ros2 topic pub -1 /inference/objects_to_track std_msgs/msg/String   \\\"{data: 'apple, lemon, baseball'}\\\"\" && echo \"ros2 topic pub -1 /inference/prompt std_msgs/msg/String \\\"{data: 'pick lemon'}\\\"\" && python gsam_cutie_tracker_node.py" C-m
 
-tmux new-window -t "$SESSION" -n "foundation_pose"
-tmux send-keys -t "SESSION:foundation_pose" \
-  "$COMMON_SETUP python pose_tracker_action_node.py --ros-args \
-  -r __ns:=/pose_tracker \
-  -r /pose_tracker/tf:=/tf \
-  -r /pose_tracker/tf_static:=/tf_static \
-  -p foundationpose_root:=/home/bi_admin/RFM/thirdparty/FoundationPose \
-  -p mesh_file:=/home/bi_admin/RFM/ycb/013_apple/google_16k/textured.obj \
-  -p base_frame:=base_link" C-m
+tmux new-window -t "$SESSION" -n "pose_tracker"
+tmux send-keys -t "$SESSION:pose_tracker" \
+  "cd $ROOT_DIR && ROS_DOMAIN_ID=$ROS_DOMAIN_ID ROS_LOCALHOST_ONLY=$ROS_LOCALHOST_ONLY RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION bash scripts/run_inside_docker_foxy.sh" C-m
 
 tmux select-window -t "$SESSION:realsense"
 tmux attach -t "$SESSION"
-

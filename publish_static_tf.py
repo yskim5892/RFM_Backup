@@ -1,5 +1,6 @@
 import argparse
 import numpy as np
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -15,11 +16,21 @@ def build_T(vals):
     return np.array(vals, dtype=float).reshape(4, 4)
 
 
-class StaticTFPublisher(Node):
-    def __init__(self, T: np.ndarray, parent: str, child: str):
-        super().__init__("static_tf_publisher_from_matrix")
-        self._broadcaster = StaticTransformBroadcaster(self)
+def load_T_from_file(matrix_file: str) -> np.ndarray:
+    text = Path(matrix_file).read_text(encoding="utf-8")
+    tokens = text.replace(",", " ").split()
+    if len(tokens) != 16:
+        raise ValueError(f"Matrix file must contain exactly 16 numbers, got {len(tokens)}: {matrix_file}")
+    vals = [float(v) for v in tokens]
+    return build_T(vals)
 
+
+class StaticTFPublisher:
+    def __init__(self, node: Node):
+        self._node = node
+        self._broadcaster = StaticTransformBroadcaster(node)
+
+    def publish_from_matrix(self, T: np.ndarray, parent: str, child: str):
         # translation
         x, y, z = float(T[0, 3]), float(T[1, 3]), float(T[2, 3])
 
@@ -28,7 +39,7 @@ class StaticTFPublisher(Node):
         qx, qy, qz, qw = math_utils.mat_to_quat(R)
 
         t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.stamp = self._node.get_clock().now().to_msg()
         t.header.frame_id = parent
         t.child_frame_id = child
 
@@ -44,11 +55,15 @@ class StaticTFPublisher(Node):
         # publish once (static broadcaster uses transient local QoS)
         self._broadcaster.sendTransform(t)
 
-        self.get_logger().info(
+        self._node.get_logger().info(
             f"Published static TF {parent} -> {child}: "
             f"t=({x:.6f},{y:.6f},{z:.6f}) "
             f"q=({qx:.6f},{qy:.6f},{qz:.6f},{qw:.6f})"
         )
+
+    def publish_from_file(self, matrix_file: str, parent: str, child: str):
+        T = load_T_from_file(matrix_file)
+        self.publish_from_matrix(T=T, parent=parent, child=child)
 
 
 def main():
@@ -56,9 +71,10 @@ def main():
         description="Publish a static TF from a 4x4 matrix using rclpy/tf2_ros."
     )
     parser.add_argument(
-        "m", nargs=16, type=float,
-        help="16 numbers for 4x4 transform matrix in row-major order"
+        "m", nargs="*", type=float,
+        help="(optional) 16 numbers for 4x4 transform matrix in row-major order"
     )
+    parser.add_argument("--matrix-file", default="", help="Text file containing a 4x4 matrix (16 numbers)")
     parser.add_argument("--parent", default="tool0", help="parent frame (default: tool0)")
     parser.add_argument("--child", default="camera_link", help="child frame (default: camera_link)")
     parser.add_argument(
@@ -68,14 +84,21 @@ def main():
     )
     args = parser.parse_args()
 
-    T = build_T(args.m)
+    if args.matrix_file:
+        T = load_T_from_file(args.matrix_file)
+    elif len(args.m) == 16:
+        T = build_T(args.m)
+    else:
+        parser.error("Provide --matrix-file <path> or 16 matrix numbers.")
 
     rclpy.init()
-    node = StaticTFPublisher(T=T, parent=args.parent, child=args.child)
+    node = Node("static_tf_publisher_from_matrix")
+    publisher = StaticTFPublisher(node)
+    publisher.publish_from_matrix(T=T, parent=args.parent, child=args.child)
 
     try:
         if args.once_and_exit:
-            # publish already done in ctor; exit
+            # publish already done above; exit
             pass
         else:
             # keep alive so late-joining subscribers definitely get it, and for easier debugging
@@ -87,4 +110,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

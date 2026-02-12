@@ -1,0 +1,11 @@
+# Goal
+sensor_msgs/JointState target_joint
+bool relative
+---
+# Result
+bool success
+string message
+---
+# Feedback
+sensor_msgs/JointState current_joint
+string status

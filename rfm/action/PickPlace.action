@@ -1,0 +1,10 @@
+# Goal
+int32 from_id
+int32 to_id
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string status

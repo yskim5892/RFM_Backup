@@ -1,8 +1,9 @@
 _backup_thirdparty
 ycb/
 __pycache__/
-rfm/install
-rfm/build
-rfm/log
+*.pyc
+.vscode/
+rfm/install*
+rfm/build*
+rfm/log*
 rfm/weights
-

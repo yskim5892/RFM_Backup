@@ -57,12 +57,13 @@ class UR5RTDEBridge(Node):
 
         # moveL params (TCP)
         self.speed_l = float(self.declare_parameter("speed_l", 0.10).value)   # m/s
-        self.accel_l = float(self.declare_parameter("accel_l", 0.25).value)   # m/s^2
+        self.accel_l = float(self.declare_parameter("accel_l", 0.10).value)   # m/s^2
 
         # moveJ params (joint). If not set, these defaults are reasonable.
-        self.speed_j = float(self.declare_parameter("speed_j", 1.0).value)    # rad/s
-        self.accel_j = float(self.declare_parameter("accel_j", 1.0).value)    # rad/s^2
+        self.speed_j = float(self.declare_parameter("speed_j", 0.5).value)    # rad/s
+        self.accel_j = float(self.declare_parameter("accel_j", 0.5).value)    # rad/s^2
 
+        self.tcp_frame = str(self.declare_parameter("tcp_frame", "base").value)
         self.publish_rate = float(self.declare_parameter("publish_rate", 30.0).value)
 
         # ---- RTDE ----
@@ -154,6 +155,7 @@ class UR5RTDEBridge(Node):
 
             msg = PoseStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = self.tcp_frame
             msg.pose.position.x = x
             msg.pose.position.y = y
             msg.pose.position.z = z
@@ -280,9 +282,28 @@ class UR5RTDEBridge(Node):
                 name = str(k).strip().lower()
                 if not name:
                     continue
+                try:
+                    if isinstance(v, list) and len(v) == 6:
+                        loaded[name] = {"type": "joint", "q": [float(x) for x in v]}
+                        continue
 
-                loaded[name] = {"type": "joint", "q": [float(x) for x in v["q"]]}
-                continue
+                    if not isinstance(v, dict):
+                        self.get_logger().warn(f"Skip invalid pose entry '{name}': expected dict/list, got {type(v).__name__}")
+                        continue
+
+                    if v.get("type") != "joint":
+                        self.get_logger().warn(f"Skip invalid pose entry '{name}': type must be 'joint'")
+                        continue
+
+                    q = v.get("q")
+                    if not (isinstance(q, list) and len(q) == 6):
+                        self.get_logger().warn(f"Skip invalid pose entry '{name}': q must be a list of 6 floats")
+                        continue
+
+                    loaded[name] = {"type": "joint", "q": [float(x) for x in q]}
+                except Exception as e:
+                    self.get_logger().warn(f"Skip invalid pose entry '{name}': {e}")
+                    continue
 
             self.pose_db = loaded
             self.get_logger().info(f"Loaded pose DB: {self.pose_db_path} (keys={list(self.pose_db.keys())})")
@@ -483,4 +504,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

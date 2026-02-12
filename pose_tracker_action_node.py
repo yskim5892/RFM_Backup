@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import os
 import sys
 import threading
 import traceback
+import logging
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -11,20 +11,22 @@ import cv2
 
 import tf2_ros
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from rclpy.duration import Duration
 from rclpy.time import Time
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from std_msgs.msg import String, Int32
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from rfm.action import MoveTcp
 
 import message_filters
-from math_utils import quat_to_mat, mat_to_quat, tf_to_T, pose_to_T
-
-
+from math_utils import mat_to_quat, quat_to_mat, tf_to_T
+from publish_static_tf import StaticTFPublisher
 
 # ----------------- PoseTracker -----------------
 class PoseTrackerFoundationPose(Node):
@@ -33,6 +35,7 @@ class PoseTrackerFoundationPose(Node):
 
         self.lock = threading.Lock()
         self.busy = False
+        self.current_status = "READY"
 
         # -------- params --------
         repo_root = Path(__file__).resolve().parent
@@ -44,35 +47,69 @@ class PoseTrackerFoundationPose(Node):
 
         self.depth_scale = 0.001  # uint16(mm)->m
 
-        self.target_object_id = int(self.declare_parameter("target_object_id", 0).value)  # 0 => auto(largest)
         self.min_mask_pixels = int(self.declare_parameter("min_mask_pixels", 200).value)
 
         self.est_refine_iter = int(self.declare_parameter("est_refine_iter", 5).value)
         self.track_refine_iter = int(self.declare_parameter("track_refine_iter", 2).value)
+        self.sync_queue_size = int(self.declare_parameter("sync_queue_size", 120).value)
+        self.sync_slop_sec = float(self.declare_parameter("sync_slop_sec", 0.35).value)
 
         # TCP heuristic
         self.pregrasp_height = float(self.declare_parameter("pregrasp_height", 0.25).value)  # meters above object
 
         self.color_topic = "/wrist_cam/camera/color/image_raw"
         self.depth_topic = "/wrist_cam/camera/aligned_depth_to_color/image_raw"
-        self.instance_mask_topic = "/perception/instance_mask"
+        self.instance_mask_topic = "/perception/target_object_mask"
         self.initial_prompt = self.declare_parameter("prompt", "").value
+        self.static_tf_file = str(self.declare_parameter("static_tf_file", str(self.repo_root / "T_wrist_cam.txt")).value)
+        bridge_node_name = str(self.declare_parameter("bridge_node_name", "ur5").value).strip("/")
+        self.bridge_prefix = f"/{bridge_node_name}"
+        self.ur5_tcp_topic = self.declare_parameter("ur5_tcp_topic", f"{self.bridge_prefix}/tcp_pose").value
+        self.ur5_status_topic = self.declare_parameter("ur5_status_topic", f"{self.bridge_prefix}/status").value
+        self.ur5_move_tcp_action = self.declare_parameter("ur5_move_tcp_action", f"{self.bridge_prefix}/move_tcp").value
+        self.ur5_action_wait_timeout = float(self.declare_parameter("ur5_action_wait_timeout", 0.05).value)
 
         # -------- TF --------
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.static_tf_publisher = StaticTFPublisher(self)
+        try:
+            self.static_tf_publisher.publish_from_file(matrix_file=self.static_tf_file, parent="tool0", child="camera_link")
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish static TF from file '{self.static_tf_file}': {e}")
 
         # -------- outputs (relative to /pose_tracker namespace) --------
         self.pub_T_base_obj = self.create_publisher(PoseStamped, "/pose_tracker/T_base_obj", 10)
         self.pub_T_cam_obj = self.create_publisher(PoseStamped, "/pose_tracker/T_cam_obj", 10)
-        self.pub_target_tcp = self.create_publisher(PoseStamped, "/ur5/goal_tcp_pose", 10)
+        self.pub_target_tcp = self.create_publisher(PoseStamped, "/pose_tracker/target_tcp_pose", 10)
         self.pub_pose_vis = self.create_publisher(Image, "/pose_tracker/pose_vis", 10)  # pose visualization (overlay on RGB)
-        self.pub_status = self.create_publisher(String, "/pose_tracker/status", 10)
+        status_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub_status = self.create_publisher(String, "/pose_tracker/status", status_qos)
+        self.sub_tcp_pose = self.create_subscription(PoseStamped, self.ur5_tcp_topic, self._on_tcp_pose, 10)
+        self._latest_tcp_R_base: Optional[np.ndarray] = None
 
-        # optional input: /pose_tracker/target_object_id
-        self.sub_target_id = self.create_subscription(Int32, "/pose_tracker/target_object_id", self._on_target_id, 10)
-        self.sub_prompt = self.create_subscription(String, "/inferece/prompt", self._on_prompt, 10)
+        # UR5 status monitoring
+        self.ur5_status = "IDLE"
+        self.sub_ur5_status = self.create_subscription(String, self.ur5_status_topic, self._on_ur5_status, 10)
+        self.act_move_tcp = ActionClient(self, MoveTcp, self.ur5_move_tcp_action)
+        self._move_tcp_goal_pending = False
+
+        # input: /inference/prompt  (typo fix)
+        self.sub_prompt = self.create_subscription(String, "/inference/prompt", self._on_prompt, 10)
+
+        # prompt/mask gating + debounce for sending tcp action goal
+        self._has_prompt = False
+        self._target_mask_msg_count = 0
+        self._required_target_mask_count: Optional[int] = None
+        self._good_start_ns = None  # nanoseconds; None when not in "good streak"
+        self._good_required_ns = int(0.3 * 1e9)  # 0.3s
+        self._warned_once_keys: set[str] = set()
 
         # service: /pose_tracker/reset
         self.srv_reset = self.create_service(Trigger, "/pose_tracker/reset", self._on_reset)
@@ -80,67 +117,65 @@ class PoseTrackerFoundationPose(Node):
         # -------- camera intrinsics --------
         self.K: Optional[np.ndarray] = None
         self.sub_cam_info = self.create_subscription(CameraInfo, "/wrist_cam/camera/color/camera_info", self._on_cam_info, 10)
+        self.sub_target_mask_arrived = self.create_subscription(
+            Image, self.instance_mask_topic, self._on_target_mask_arrived, qos_profile_sensor_data
+        )
 
         # -------- FoundationPose init --------
         if self.foundationpose_root not in sys.path:
             sys.path.insert(0, self.foundationpose_root)
-        os.chdir(self.foundationpose_root)
-        
+
         import torch
         import trimesh
         import nvdiffrast.torch as dr
         from estimater import FoundationPose, ScorePredictor, PoseRefinePredictor
+        # Suppress noisy FoundationPose INFO logs (e.g. register/track internals).
+        logging.getLogger().setLevel(logging.ERROR)
 
         self.torch = torch
-
         self.trimesh = trimesh
+        self.FoundationPose = FoundationPose
 
         self.scorer = ScorePredictor()
         self.refiner = PoseRefinePredictor()
         self.glctx = dr.RasterizeCudaContext()
+        self.fp_debug_dir = "/tmp/foundationpose_debug"
 
-        # Load Default Mesh 
-        self.mesh, model_normals = self._resolve_mesh_file('apple')
-        self.foundation_pose = FoundationPose(
-            model_pts=self.mesh.vertices,
-            model_normals=model_normals,
-            mesh=self.mesh,
-            scorer=self.scorer,
-            refiner=self.refiner,
-            debug_dir="/tmp/foundationpose_debug",
-            debug=0,
-            glctx=self.glctx,
-        )
+        # FoundationPose는 prompt 기반 객체가 정해질 때 lazy init/reset.
+        self.mesh = None
+        self.foundation_pose = None
         self.current_object_name = ""
 
         self.initialized = False
-        self.current_status = "READY"
         self._status_timer = self.create_timer(0.3, self._publish_status)
 
         # -------- time sync: color + depth + instance_mask --------
-        color_sub = message_filters.Subscriber(
-            self, Image, self.color_topic, qos_profile=qos_profile_sensor_data
-        )
-        depth_sub = message_filters.Subscriber(
-            self, Image, self.depth_topic, qos_profile=qos_profile_sensor_data
-        )
-        mask_sub = message_filters.Subscriber(
-            self, Image, self.instance_mask_topic, qos_profile=qos_profile_sensor_data
-        )
+        self.color_sub = message_filters.Subscriber(self, Image, self.color_topic, qos_profile=qos_profile_sensor_data)
+        self.depth_sub = message_filters.Subscriber(self, Image, self.depth_topic, qos_profile=qos_profile_sensor_data)
+        self.mask_sub = message_filters.Subscriber(self, Image, self.instance_mask_topic, qos_profile=qos_profile_sensor_data)
 
-        sync = message_filters.ApproximateTimeSynchronizer([color_sub, depth_sub, mask_sub], 10, 0.05)
-        sync.registerCallback(self._on_synced)
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [self.color_sub, self.depth_sub, self.mask_sub],
+            self.sync_queue_size,
+            self.sync_slop_sec,
+        )
+        self.sync.registerCallback(self._on_synced)
+        self._synced_once = False
 
         self.get_logger().info(
             "PoseTracker ready.\n"
             f"  Sub color: {self.color_topic}\n"
             f"  Sub depth: {self.depth_topic}\n"
             f"  Sub mask : {self.instance_mask_topic}\n"
-            f"  Pub /pose_tracker/T_base_obj, /pose_tracker/T_cam_obj, /pose_tracker/goal_tcp_pose, /pose_tracker/status\n"
+            f"  Sub UR5 tcp/status: {self.ur5_tcp_topic}, {self.ur5_status_topic}\n"
+            f"  Action MoveTcp: {self.ur5_move_tcp_action}\n"
+            "  Pub /pose_tracker/T_base_obj, /pose_tracker/T_cam_obj, /pose_tracker/target_tcp_pose, /pose_tracker/status\n"
+            f"  Sync queue/slop: {self.sync_queue_size}, {self.sync_slop_sec:.3f}s\n"
         )
 
         if self.initial_prompt:
             self._on_prompt(String(data=self.initial_prompt))
+        self._publish_status()
 
     def _normalize_object_name(self, name: str) -> str:
         return (name or "").strip().lower().replace(" ", "_")
@@ -182,12 +217,41 @@ class PoseTrackerFoundationPose(Node):
             return False
 
         try:
-            self.foundation_pose.reset_object(
-                model_pts=mesh.vertices,
-                model_normals=model_normals,
-                symmetry_tfs=None,
-                mesh=mesh,
-            )
+            if self.foundation_pose is None:
+                self.foundation_pose = self.FoundationPose(
+                    model_pts=mesh.vertices,
+                    model_normals=model_normals,
+                    mesh=mesh,
+                    scorer=self.scorer,
+                    refiner=self.refiner,
+                    debug_dir=self.fp_debug_dir,
+                    debug=0,
+                    glctx=self.glctx,
+                )
+            else:
+                self.foundation_pose.reset_object(
+                    model_pts=mesh.vertices,
+                    model_normals=model_normals,
+                    symmetry_tfs=None,
+                    mesh=mesh,
+                )
+            # --- Analyze Mesh for Grasping ---
+            try:
+                # trimesh.bounds.oriented_bounds(mesh) returns (transform, extents)
+                self.T_obb_mesh, self.obb_extents = self.trimesh.bounds.oriented_bounds(mesh)
+            except Exception as e:
+                self.get_logger().error(f"Failed to compute OBB: {e}")
+                self.T_obb_mesh, self.obb_extents = np.eye(4), np.array([0.1, 0.1, 0.1])
+            self.idx_shortest = np.argmin(self.obb_extents)
+            
+            # Compute Mesh Centroid (Min/Max based)
+            min_bound = mesh.vertices.min(axis=0)
+            max_bound = mesh.vertices.max(axis=0)
+            self.mesh_centroid_obj = (min_bound + max_bound) / 2.0
+            
+            self.get_logger().info(f"Loaded '{object_name}': OBB extents={self.obb_extents}, shortest_idx={self.idx_shortest}, centroid={self.mesh_centroid_obj}")
+            # ---------------------------------
+
             self.mesh = mesh
             self.current_object_name = self._normalize_object_name(object_name)
             self.initialized = False
@@ -201,7 +265,7 @@ class PoseTrackerFoundationPose(Node):
         parts = (prompt_text or "").strip().split()
         if len(parts) < 2:
             return None
-        return parts[1]
+        return " ".join(parts[1:]).strip()
 
     def _on_prompt(self, msg: String):
         obj_name = self._extract_object_from_prompt(msg.data)
@@ -211,6 +275,12 @@ class PoseTrackerFoundationPose(Node):
         ok = self._reset_foundation_pose_object(obj_name)
         if not ok:
             self._set_status("ERROR")
+            self._has_prompt = False
+            self._required_target_mask_count = None
+            return
+        self._has_prompt = True
+        self._required_target_mask_count = self._target_mask_msg_count + 1
+        self._good_start_ns = None  # prompt 바뀌면 안정화 다시
 
     def _publish_status(self):
         msg = String()
@@ -220,16 +290,22 @@ class PoseTrackerFoundationPose(Node):
     def _set_status(self, s: str):
         if s != self.current_status:
             self.current_status = s
+            self._publish_status()
 
-    def _on_target_id(self, msg: Int32):
-        self.target_object_id = int(msg.data)
-        # 새 target id 지정되면 다음 프레임에서 register 다시 하도록
-        self.initialized = False
-        self._set_status("READY")
+    def _warn_once(self, key: str, msg: str):
+        if key in self._warned_once_keys:
+            return
+        self._warned_once_keys.add(key)
+        self.get_logger().warning(msg)
+
+    def _clear_warn(self, key: str):
+        self._warned_once_keys.discard(key)
+
 
     def _on_reset(self, req, resp):
         self.initialized = False
         self._set_status("READY")
+        self._good_start_ns = None
         resp.success = True
         resp.message = "reset ok"
         return resp
@@ -237,6 +313,19 @@ class PoseTrackerFoundationPose(Node):
     def _on_cam_info(self, msg: CameraInfo):
         if self.K is None:
             self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+
+    def _on_tcp_pose(self, msg: PoseStamped):
+        q = msg.pose.orientation
+        self._latest_tcp_R_base = quat_to_mat([q.x, q.y, q.z, q.w])
+        self._latest_tcp_p_base = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+
+    def _on_ur5_status(self, msg: String):
+        self.ur5_status = msg.data
+        if self.ur5_status == "IDLE":
+            self._move_tcp_goal_pending = False
+
+    def _on_target_mask_arrived(self, _msg: Image):
+        self._target_mask_msg_count += 1
 
     def _decode_rgb(self, msg: Image) -> np.ndarray:
         img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
@@ -273,44 +362,85 @@ class PoseTrackerFoundationPose(Node):
             return m
         raise RuntimeError(f"Unsupported mask encoding: {msg.encoding}")
 
-    def _choose_target_id(self, inst: np.ndarray) -> int:
-        # 0 => background, 1..N => track_id
-        ids, cnt = np.unique(inst, return_counts=True)
-        valid = [(i, c) for i, c in zip(ids.tolist(), cnt.tolist()) if i != 0]
-        if not valid:
-            return 0
-        valid.sort(key=lambda x: x[1], reverse=True)
-        return int(valid[0][0])
-
-    def _compute_target_tcp_T(self, T_base_obj: np.ndarray) -> np.ndarray:
-        p = T_base_obj[:3, 3]
-        R_obj = T_base_obj[:3, :3]
-
-        # z down (base frame)
-        z_tcp = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-
-        # align x with object x projected on xy
-        x_obj = R_obj[:, 0].copy()
-        x_obj[2] = 0.0
-        n = np.linalg.norm(x_obj)
-        if n < 1e-6:
-            x_tcp = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    def _compute_target_tcp_T(self, T_base_obj: np.ndarray, x_axis_base: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        # T_base_obj: 4x4 (Object Pose from FoundationPose)
+        # x_axis_base: 3x1 (Shortest horizontal axis of the object in Base Frame)
+        # Note: FoundationPose T_base_obj origin is usually arbitrary (mesh origin).
+        
+        # 0. Correct Object Position (Centroid)
+        # Transform mesh centroid to Base Frame
+        if hasattr(self, 'mesh_centroid_obj'):
+            p_center_obj = self.mesh_centroid_obj
+            # p_center_base = R * p_center_obj + t
+            p_obj_base = (T_base_obj[:3, :3] @ p_center_obj) + T_base_obj[:3, 3]
         else:
-            x_tcp = x_obj / n
+            # Fallback
+            p_obj_base = T_base_obj[:3, 3]
 
-        y_tcp = np.cross(z_tcp, x_tcp)
-        y_tcp /= (np.linalg.norm(y_tcp) + 1e-12)
-        x_tcp = np.cross(y_tcp, z_tcp)  # re-orthogonalize
+        # Check if we have OBB info
+        if not hasattr(self, 'T_obb_mesh') or self.T_obb_mesh is None:
+            # Fallback to old behavior
+            if self._latest_tcp_R_base is None:
+                self._warn_once("tcp_pose_missing", f"Current TCP pose is not available yet ({self.ur5_tcp_topic}).")
+                return None
+            R_tcp = self._latest_tcp_R_base
+            z_tcp_base = R_tcp[:, 2]
+            z_tcp_base /= (np.linalg.norm(z_tcp_base) + 1e-12)
+            p_tcp = p_obj_base - z_tcp_base * self.pregrasp_height
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = R_tcp
+            T[:3, 3] = p_tcp
+            return T
 
-        R_tcp = np.stack([x_tcp, y_tcp, z_tcp], axis=1)
+        # 1. Determine Approach Axis (Target Gripper Z)
+        # "Dynamic Approach": Point Z-axis from Current TCP -> Object Centroid
+        if not hasattr(self, '_latest_tcp_p_base') or self._latest_tcp_p_base is None:
+            self._warn_once("tcp_pose_missing", f"Current TCP pose is not available yet ({self.ur5_tcp_topic}).")
+            return None
 
-        p_tcp = p - z_tcp * self.pregrasp_height  # up by pregrasp_height
+        p_current = self._latest_tcp_p_base
+        v_approach = p_obj_base - p_current
+        dist = np.linalg.norm(v_approach)
+        if dist > 1e-3:
+            v_approach /= dist
+        else:
+            v_approach = np.array([0.0, 0.0, -1.0]) # Fallback (at object?)
+
+        # Project ideal approach to be perpendicular to x_target
+        dot_val = np.dot(v_approach, x_axis_base)
+        z_raw = v_approach - dot_val * (x_axis_base)
+        
+        if np.linalg.norm(z_raw) < 0.1:
+             # ideal approach is parallel to X
+             z_target = np.array([0.0, 0.0, -1.0])
+        else:
+             z_target = z_raw / np.linalg.norm(z_raw)
+
+        # 2. Compute Gripper Y
+        y_target = np.cross(z_target, x_axis_base) 
+        
+        # Construct R
+        R_tcp = np.column_stack((x_axis_base, y_target, z_target))
+        
+        # 3. Compute Position
+        # Apply pregrasp offset along wrist-local +Z, converted into base frame.
+        z_wrist_local = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        z_wrist_in_base = R_tcp @ z_wrist_local
+        p_tcp = p_obj_base - z_wrist_in_base * self.pregrasp_height
+        
+        # 4. Safety Checks
+        if p_tcp[2] < 0.2:
+            self._warn_once("tcp_too_low", f"Computed TCP z={p_tcp[2]:.3f} is too low. Clamping.")
+            p_tcp[2] = 0.2
+        self._clear_warn("tcp_too_low")
+
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = R_tcp
         T[:3, 3] = p_tcp
         return T
 
-    def _publish_pose(self, topic_pub, frame_id: str, stamp, T: np.ndarray):
+    @staticmethod
+    def _make_pose_msg(frame_id: str, stamp, T: np.ndarray) -> PoseStamped:
         msg = PoseStamped()
         msg.header.frame_id = frame_id
         msg.header.stamp = stamp
@@ -325,8 +455,61 @@ class PoseTrackerFoundationPose(Node):
         msg.pose.orientation.y = float(q[1])
         msg.pose.orientation.z = float(q[2])
         msg.pose.orientation.w = float(q[3])
+        return msg
 
+    def _publish_pose(self, topic_pub, frame_id: str, stamp, T: np.ndarray):
+        msg = self._make_pose_msg(frame_id, stamp, T)
         topic_pub.publish(msg)
+
+    def _send_move_tcp_goal(self, T_base_tcp: np.ndarray, stamp):
+        if self._move_tcp_goal_pending:
+            self._warn_once("move_tcp_pending", "MoveTcp goal is still pending. Skip new goal.")
+            return
+        self._clear_warn("move_tcp_pending")
+        if not self.act_move_tcp.wait_for_server(timeout_sec=self.ur5_action_wait_timeout):
+            self._warn_once("move_tcp_server_unavailable", f"MoveTcp action server unavailable: {self.ur5_move_tcp_action}")
+            return
+        self._clear_warn("move_tcp_server_unavailable")
+
+        goal = MoveTcp.Goal()
+        goal.relative = False
+        goal.target_pose = self._make_pose_msg(self.base_frame, stamp, T_base_tcp)
+
+        self._move_tcp_goal_pending = True
+        send_future = self.act_move_tcp.send_goal_async(goal)
+        send_future.add_done_callback(self._on_move_tcp_goal_response)
+
+    def _on_move_tcp_goal_response(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self._move_tcp_goal_pending = False
+            self._warn_once("move_tcp_send_failed", f"MoveTcp goal send failed: {e}")
+            return
+        self._clear_warn("move_tcp_send_failed")
+
+        if not goal_handle.accepted:
+            self._move_tcp_goal_pending = False
+            self._warn_once("move_tcp_goal_rejected", "MoveTcp goal rejected by action server.")
+            return
+        self._clear_warn("move_tcp_goal_rejected")
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_move_tcp_result)
+
+    def _on_move_tcp_result(self, future):
+        self._move_tcp_goal_pending = False
+        try:
+            result_msg = future.result()
+            result = result_msg.result
+            if not result.success:
+                self._warn_once("move_tcp_result_failed", f"MoveTcp failed: {result.message}")
+                return
+            self._clear_warn("move_tcp_result_failed")
+        except Exception as e:
+            self._warn_once("move_tcp_result_exception", f"MoveTcp result exception: {e}")
+            return
+        self._clear_warn("move_tcp_result_exception")
 
     @staticmethod
     def _project_uv(K: np.ndarray, p_cam: np.ndarray) -> Optional[Tuple[int, int]]:
@@ -358,7 +541,7 @@ class PoseTrackerFoundationPose(Node):
         msg.data = rgb.tobytes()
         pub.publish(msg)
 
-    def _make_pose_vis(self, rgb: np.ndarray, mask: np.ndarray, K: np.ndarray, T_cam_obj: np.ndarray) -> np.ndarray:
+    def _make_pose_vis(self, rgb: np.ndarray, mask: np.ndarray, K: np.ndarray, T_cam_obj: np.ndarray, x_axis_cam: Optional[np.ndarray] = None) -> np.ndarray:
         """Draw mask contour + xyz axes (R,G,B) from T_cam_obj on an RGB image."""
         vis = rgb.copy()
 
@@ -393,6 +576,29 @@ class PoseTrackerFoundationPose(Node):
         if p0 is not None:
             cv2.circle(vis, p0, max(2, th + 1), (255, 255, 255), -1)  # white
 
+        # Draw Centroid (Cyan)
+        p_center_uv = None
+        if hasattr(self, 'mesh_centroid_obj'):
+            p_center_obj = self.mesh_centroid_obj
+            p_center_cam = (T_cam_obj[:3, :3] @ p_center_obj) + T_cam_obj[:3, 3]
+            p_center_uv = self._project_uv(K, p_center_cam)
+            if p_center_uv is not None:
+                cv2.circle(vis, p_center_uv, 5, (0, 255, 255), -1)
+
+        # Draw Shortest Axis (Magenta)
+        # x_axis_cam is a Direction vector in Camera Frame. 
+        # Start at Centroid (if available) or Origin.
+        if x_axis_cam is not None:
+            # Using Centroid as start if available
+            start_cam = p_center_cam if (hasattr(self, 'mesh_centroid_obj') and 'p_center_cam' in locals()) else t
+            end_cam = start_cam + x_axis_cam * 0.08 # 8cm length
+            
+            uv_start = self._project_uv(K, start_cam)
+            uv_end = self._project_uv(K, end_cam)
+            
+            if uv_start is not None and uv_end is not None:
+                cv2.line(vis, uv_start, uv_end, (255, 0, 255), 2) # Magenta
+
         # X=red, Y=green, Z=blue (RGB)
         if p0 is not None and px is not None:
             cv2.line(vis, p0, px, (255, 0, 0), th)
@@ -421,26 +627,55 @@ class PoseTrackerFoundationPose(Node):
 
     def _lookup_T_base_cam(self, cam_frame: str, stamp) -> Optional[np.ndarray]:
         try:
-            #t = Time.from_msg(stamp)
-            tf = self.tf_buffer.lookup_transform(self.base_frame, cam_frame, Time(), timeout=Duration(seconds=0.1))
+            t = Time.from_msg(stamp)
+            tf = self.tf_buffer.lookup_transform(self.base_frame, cam_frame, t, timeout=Duration(seconds=0.1))
+            self._clear_warn("tf_lookup_failed")
             return tf_to_T(tf)
         except Exception as e:
-            self.get_logger().warn(
+            self._warn_once("tf_lookup_failed",
                 f"TF lookup failed: {self.base_frame} <- {cam_frame} at stamp={stamp.sec}.{stamp.nanosec}: {e}"
             )
             return None
 
     def _on_synced(self, color_msg: Image, depth_msg: Image, mask_msg: Image):
-        if self.K is None:
+        if not self._synced_once:
+            self._synced_once = True
+            self.get_logger().info("First synced color/depth/mask frame received.")
+        # UR5 Moving Check
+        if self.ur5_status == "MOVING":
+            self._warn_once("ur5_moving", "UR5 is Moving, skipping pose estimation")
             return
+        self._clear_warn("ur5_moving")
+        
+        if self.K is None:
+            self._warn_once("no_camera_intrinsics", "Camera Intrinsics not arrived")
+            return
+        self._clear_warn("no_camera_intrinsics")
+
         if self.mesh is None:
+            self._warn_once("mesh_not_loaded", "Mesh not Loaded")
             self._set_status("READY")
             return
+        self._clear_warn("mesh_not_loaded")
+
+        # /inference/prompt와 해당 prompt 이후 target mask가 모두 준비되어야 진행
+        if not self._has_prompt:
+            self._warn_once("prompt_not_arrived", "Prompt has not arrived")
+            return
+        self._clear_warn("prompt_not_arrived")
+
+        if (self._required_target_mask_count is not None) and self._target_mask_msg_count < self._required_target_mask_count:
+            self._warn_once("waiting_target_mask", "Waiting for Target Mask")
+            self._set_status("WAIT_MASK")
+            return
+        self._clear_warn("waiting_target_mask")
 
         with self.lock:
             if self.busy:
+                self._warn_once("busy", "Busy")
                 return
             self.busy = True
+        self._clear_warn("busy")
 
         try:
             rgb = self._decode_rgb(color_msg)
@@ -456,23 +691,23 @@ class PoseTrackerFoundationPose(Node):
             # camera frame
             cam_frame = self.camera_frame or (color_msg.header.frame_id or "")
             if not cam_frame:
+                self._warn_once("cam_frame_missing", "Cam Frame has not arrived")
                 self._set_status("ERROR")
                 return
+            self._clear_warn("cam_frame_missing")
 
-            # choose target id
-            obj_id = self.target_object_id
-            if obj_id <= 0:
-                obj_id = self._choose_target_id(inst)
-            if obj_id == 0:
-                self._set_status("NO_TARGET")
-                self.initialized = False
-                return
+            # target_object_mask는 0/1(또는 0/nonzero) 단일 타겟 마스크로 가정
+            mask = (inst != 0)
 
-            mask = (inst == obj_id)
             if int(mask.sum()) < self.min_mask_pixels:
+                self._warn_once("mask_too_small", "Mask Area too small")
                 self._set_status("NO_TARGET")
                 self.initialized = False
+                self._good_start_ns = None
                 return
+            self._clear_warn("mask_too_small")
+            if self._required_target_mask_count is not None:
+                self._required_target_mask_count = None
             K = self.K.astype(np.float64, copy=False)
             depth = depth.astype(np.float32, copy=False)
             rgb = rgb.astype(np.uint8, copy=False) 
@@ -484,8 +719,10 @@ class PoseTrackerFoundationPose(Node):
                     T_cam_obj = self.foundation_pose.register(K=K, rgb=rgb, depth=depth,
                                                       ob_mask=mask, iteration=self.est_refine_iter)
                     if T_cam_obj is None:
+                        self._warn_once("register_failed", "FoundationPose could not register target")
                         self._set_status("NO_TARGET")
                         return
+                    self._clear_warn("register_failed")
                     self.initialized = True
                 else:
                     T_cam_obj = self.foundation_pose.track_one(rgb=rgb, depth=depth, K=K,
@@ -501,6 +738,8 @@ class PoseTrackerFoundationPose(Node):
             if bad:
                 self.initialized = False
                 self._set_status("READY")
+            else:
+                self._clear_warn("tracking_unhealthy")
 
             # --- TF: base <- camera ---
             T_base_cam = self._lookup_T_base_cam(cam_frame, color_msg.header.stamp)
@@ -513,15 +752,40 @@ class PoseTrackerFoundationPose(Node):
             self._publish_pose(self.pub_T_base_obj, self.base_frame, color_msg.header.stamp, T_base_obj)
             self._publish_pose(self.pub_T_cam_obj, cam_frame, color_msg.header.stamp, T_cam_obj)
 
-            # optional TF object_<id>
-            self._broadcast_object_tf(obj_id, self.base_frame, color_msg.header.stamp, T_base_obj)
+            # optional TF object_<id> (단일 타겟이므로 id=1)
+            self._broadcast_object_tf(1, self.base_frame, color_msg.header.stamp, T_base_obj)
 
-            if not bad:
-                T_base_tcp = self._compute_target_tcp_T(T_base_obj)
-                self._publish_pose(self.pub_target_tcp, self.base_frame, color_msg.header.stamp, T_base_tcp)
+            # Compute Target TCP
+            now_ns = int(self.get_clock().now().nanoseconds)
+            
+            # Helper: Compute Horizontal X-Axis for Vis & Control
+            x_axis_base = self._compute_horizontal_x_axis(T_base_obj)
 
-            # Visualize Estimated object 6d pos
-            vis = self._make_pose_vis(rgb, mask, K, T_cam_obj)
+            if bad:
+                self._good_start_ns = None
+            else:
+                if self._good_start_ns is None:
+                    self._good_start_ns = now_ns
+                if (now_ns - self._good_start_ns) >= self._good_required_ns:
+                    # Use the pre-computed x_axis_base
+                    target_tcp = self._compute_target_tcp_T(T_base_obj, x_axis_base)
+                    
+                    if target_tcp is None:
+                        self._set_status("WAIT_TCP")
+                        return
+                    self._clear_warn("tcp_pose_missing")
+                    self._publish_pose(self.pub_target_tcp, self.base_frame, color_msg.header.stamp, target_tcp)
+                    self._send_move_tcp_goal(target_tcp, color_msg.header.stamp)
+
+            # Visualize Estimated object 6d pos + Centroid + Shortest Axis
+            # Transform x_axis_base to Camera Frame for visualization
+            x_axis_cam = None
+            if x_axis_base is not None and T_base_cam is not None:
+                R_base_cam = T_base_cam[:3, :3]
+                # x_cam = R_cam_base @ x_base = R_base_cam.T @ x_base
+                x_axis_cam = R_base_cam.T @ x_axis_base
+
+            vis = self._make_pose_vis(rgb, mask, K, T_cam_obj, x_axis_cam)
             self._publish_rgb8_image(self.pub_pose_vis, color_msg.header, vis)
 
             self._set_status("RUNNING")
@@ -529,10 +793,54 @@ class PoseTrackerFoundationPose(Node):
             self.get_logger().error(f"_on_synced exception: {e}\n{traceback.format_exc()}")
             self._set_status("ERROR")
             self.initialized = False
+            self._good_start_ns = None
         finally:
             with self.lock:
                 self.busy = False
     
+    def _compute_horizontal_x_axis(self, T_base_obj: np.ndarray) -> Optional[np.ndarray]:
+        """Compute the shortest horizontal axis of the object in Base Frame."""
+        if not hasattr(self, 'T_obb_mesh') or self.T_obb_mesh is None:
+            return None
+
+        R_base_obj = T_base_obj[:3, :3]
+        R_obb_mesh = self.T_obb_mesh[:3, :3]
+        extents = self.obb_extents
+        
+        # T_obb_mesh is Transform from Mesh to OBB (Aligning). 
+        # So to get OBB axes in Mesh Frame, we need the inverse rotation.
+        # R_obb_mesh is Mesh->OBB. So R_obb_mesh.T is OBB->Mesh.
+        # The axes of OBB (standard basis) in Mesh Frame are the columns of R_obb_mesh.T,
+        # which are the rows of R_obb_mesh.
+        axes_mesh = [R_obb_mesh[0, :], R_obb_mesh[1, :], R_obb_mesh[2, :]]
+        sorted_indices = np.argsort(extents)
+        
+        best_x_target = None
+        
+        for idx in sorted_indices:
+            v_axis_mesh = axes_mesh[idx]
+            v_axis_base = R_base_obj @ v_axis_mesh
+            v_axis_base /= (np.linalg.norm(v_axis_base) + 1e-9)
+            if abs(v_axis_base[2]) < 0.7:
+                best_x_target = v_axis_base
+                break
+        
+        if best_x_target is None:
+            v_axis_base = R_base_obj @ axes_mesh[sorted_indices[0]]
+            v_axis_base[2] = 0
+            best_x_target = v_axis_base
+            
+        best_x_target[2] = 0.0
+        x_target = best_x_target / (np.linalg.norm(best_x_target) + 1e-9)
+
+        # Orientation Continuity
+        if hasattr(self, '_latest_tcp_R_base') and self._latest_tcp_R_base is not None:
+            current_x = self._latest_tcp_R_base[:, 0]
+            if np.dot(x_target, current_x) < 0:
+                x_target = -x_target
+        
+        return x_target
+
     def debug_T_cam_obj(self, depth, mask, T_cam_obj, K):
         # FoundationPose가 계산한 camera 기준 object의 위치(T_cam_obj)가 정확한지 디버깅
         # T_cam_obj의 xy 값은 Cutie가 찍은 mask centroid와 비교
@@ -565,13 +873,7 @@ class PoseTrackerFoundationPose(Node):
             u_pose, v_pose = uv_pose
             dist_px = float(np.hypot(u_pose - u_mask, v_pose - v_mask))
 
-        # 3) log 핵심 지표
-        self.get_logger().info(
-            f"z_med={z_med:.3f} valid_ratio={valid_ratio:.2f} z_med_valid={z_med_valid:.3f} T_cam_obj_z={T_cam_obj_z:.3f} "
-            f"dist_px={dist_px:.1f}"
-        )
-
-        # 4) health check -> tracking reset trigget
+        # 3) health check -> tracking reset trigget
         # - valid depth가 너무 적거나
         # - z가 depth median과 크게 어긋나거나
         # - pose origin projection이 mask 중심에서 너무 멀면
@@ -585,16 +887,15 @@ class PoseTrackerFoundationPose(Node):
             bad = True
 
         if bad:
-            self.get_logger().warn(
+            self._warn_once("tracking_unhealthy",
                 "diag: tracking unhealthy -> force re-register next frame "
-                f"(valid_ratio={valid_ratio:.2f}, z_diff={(abs(z_med_valid - T_cam_obj_z) if np.isfinite(z_med_valid) else -1):.3f}, "
+                f"(valid_ratio={valid_ratio:.2f}, z_diff={(z_med_valid - T_cam_obj_z):.3f}, "
                 f"dist_px={dist_px:.1f}"
             )
 
         return bad
 
 def main():
-    ros_args = sys.argv[:1] + ["--ros-args", "-r", "tf:=/tf", "-r", "tf_static:=/tf_static"]
     rclpy.init()
     node = PoseTrackerFoundationPose()
     try:

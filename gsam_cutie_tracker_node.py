@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import os
 from pathlib import Path
 import threading
 import json
@@ -29,6 +28,7 @@ from cutie.inference.inference_core import InferenceCore
 from cutie.utils.get_default_model import get_default_model
 
 from utils import label_to_rgb
+from std_srvs.srv import Trigger
 
 
 def load_gsam(gd_config: str, gd_ckpt: str, sam_ckpt: str, device: str = "cuda"):
@@ -77,10 +77,16 @@ def gsam_make_mask(
         text_threshold=text_threshold,
     )
 
-    idx = torch.argsort(logits, descending=True)[:topk]
-    boxes = boxes[idx] 
+    if boxes is None or logits is None or len(boxes) == 0 or len(logits) == 0:
+        return np.zeros((h, w), dtype=np.uint8)
 
-    if boxes is None or len(boxes) == 0:
+    k = max(1, int(topk))
+    idx = torch.argsort(logits, descending=True)[:k]
+    if idx.numel() == 0:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    boxes = boxes[idx]
+    if len(boxes) == 0:
         return np.zeros((h, w), dtype=np.uint8)
 
     # GroundingDINO boxes: normalized cxcywh -> pixel xyxy
@@ -122,6 +128,10 @@ class GSAMCutieTracker(Node):
         self.mask_vis_topic = "/perception/instance_mask_vis"
         self.init_mask_vis_topic = "/perception/initial_mask_vis"
         self.objects_to_track_topic = "/inference/objects_to_track"
+        self.prompt_topic = "/inference/prompt"
+        self.target_mask_topic = "/perception/target_object_mask"
+        self.target_mask_vis_topic = "/perception/target_object_mask_vis"
+        self.pose_reset_srv = "/pose_tracker/reset"
         self._img_lock = threading.Lock()
 
         device = self.get_parameter("device").value
@@ -142,18 +152,30 @@ class GSAMCutieTracker(Node):
         self.mask_vis_pub = self.create_publisher(RosImage, self.mask_vis_topic, 10)      
         self.init_mask_pub = self.create_publisher(RosImage, self.init_mask_topic, 10) 
         self.init_mask_vis_pub = self.create_publisher(RosImage, self.init_mask_vis_topic, 10)   
+        self.target_mask_pub = self.create_publisher(RosImage, self.target_mask_topic, 10)
+        self.target_mask_vis_pub = self.create_publisher(RosImage, self.target_mask_vis_topic, 10)
+
+        self.prompt_sub = self.create_subscription(
+            RosString, self.prompt_topic, self._on_prompt, 10
+        )
+
+        self.pose_reset_cli = self.create_client(Trigger, self.pose_reset_srv)
 
         self.objects_to_track_sub = self.create_subscription(
             RosString, self.objects_to_track_topic, self._on_objects_to_track, 10
         )
 
-        self.objects_to_track = self._parse_objects_to_track(args.objects_to_track)
+        self.objects_to_track = []
 
         self.last_bgr = None
         self.last_header = None
         self.last_stamp_key = None
         self.last_mask_label = None
         self.init_mask_label = None
+        self.last_target_label = None
+        self._pending_target_text = None
+        self._active_target_text = None
+        self._target_instance_id = None
 
         # load GSAM once
         self.declare_parameter("gd_config", str(here / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"))
@@ -172,6 +194,10 @@ class GSAMCutieTracker(Node):
         self.processor.max_internal_size = int(self.get_parameter("max_internal_size").value)
 
         self.inited = False
+        self._on_objects_to_track(RosString(data=args.objects_to_track or ""))
+        if args.prompt:
+            self._on_prompt(RosString(data=args.prompt))
+
         hz = float(self.get_parameter("publish_rate").value)
         self.timer = self.create_timer(1.0 / max(hz, 1e-3), self._on_timer)
 
@@ -247,6 +273,58 @@ class GSAMCutieTracker(Node):
         msg.data = rgb.tobytes()
         return msg
 
+    @staticmethod
+    def _parse_prompt_to_object(prompt: str) -> str:
+        text = (prompt or "").strip()
+        if not text:
+            return ""
+        parts = text.split()
+        if len(parts) <= 1:
+            return ""
+        return " ".join(parts[1:]).strip()
+
+    @staticmethod
+    def _normalize_object_name(text: str) -> str:
+        return (text or "").strip().lower().replace(" ", "_")
+
+    def _resolve_target_instance_id(self, target_text: str) -> Optional[int]:
+        target_norm = self._normalize_object_name(target_text)
+        if not target_norm:
+            return None
+        for instance_id, obj_name in enumerate(self.objects_to_track, start=1):
+            if self._normalize_object_name(obj_name) == target_norm:
+                return instance_id
+        return None
+
+    def _on_prompt(self, msg: RosString):
+        obj = self._parse_prompt_to_object(msg.data)
+        if not obj:
+            self.get_logger().warning(f"prompt parse failed: '{msg.data}'")
+            return
+        self._active_target_text = obj
+        self._target_instance_id = self._resolve_target_instance_id(obj)
+        self.last_target_label = None
+        self._pending_target_text = obj
+        if self._target_instance_id is None:
+            self.get_logger().info(f"prompt -> target object: '{obj}' (no objects_to_track id match)")
+        else:
+            self.get_logger().info(f"prompt -> target object: '{obj}' (instance_id={self._target_instance_id})")
+
+    def _call_pose_reset_async(self):
+        if not self.pose_reset_cli.wait_for_service(timeout_sec=0.2):
+            self.get_logger().warning(f"{self.pose_reset_srv} service not available")
+            return
+        req = Trigger.Request()
+        fut = self.pose_reset_cli.call_async(req)
+        fut.add_done_callback(self._on_pose_reset_done)
+
+    def _on_pose_reset_done(self, fut):
+        try:
+            res = fut.result()
+            self.get_logger().info(f"pose reset: success={res.success}, msg='{res.message}'")
+        except Exception as e:
+            self.get_logger().warning(f"pose reset call failed: {e}")
+
     def _on_image(self, msg: RosImage):
         bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         # Copy header so that published mask messages can carry the *input image* stamp,
@@ -262,6 +340,17 @@ class GSAMCutieTracker(Node):
         objs = self._parse_objects_to_track(msg.data)
         self.objects_to_track = objs
         self.get_logger().info(f"objects_to_track updated: {self.objects_to_track}")
+        if self._active_target_text:
+            self._target_instance_id = self._resolve_target_instance_id(self._active_target_text)
+            if self._target_instance_id is None:
+                self.get_logger().info(
+                    f"active target '{self._active_target_text}' not found in objects_to_track; "
+                    "target mask will use last GSAM result."
+                )
+            else:
+                self.get_logger().info(
+                    f"active target '{self._active_target_text}' mapped to instance_id={self._target_instance_id}"
+                )
         self.inited = False
         self.last_stamp_key = None
 
@@ -281,12 +370,37 @@ class GSAMCutieTracker(Node):
             header = self.last_header
             bgr = self.last_bgr.copy()
 
+        # prompt 기반 타겟 마스크(단일) 생성/발행
+        if self._pending_target_text is not None:
+            target = self._pending_target_text
+            self._pending_target_text = None
+
+            single_mask = gsam_make_mask(
+                bgr, target, self.gd_model, self.gd_transform,
+                self.sam_predictor, self.dev, topk=1,
+                box_threshold=self.box_th, text_threshold=self.text_th,
+            )
+            target_label = (single_mask > 0).astype(np.int32)
+            self.last_target_label = target_label
+            self._publish_label_and_vis(
+                target_label, header, self.target_mask_pub, self.target_mask_vis_pub
+            )
+
+            if target_label.sum() == 0:
+                self.get_logger().warning(f"target mask empty for '{target}'")
+            else:
+                self.get_logger().info(f"published target mask for '{target}'")
+
+            self._call_pose_reset_async()
+
         stamp = header.stamp
         stamp_key = (int(stamp.sec), int(stamp.nanosec))
 
         # 새 프레임이 없으면 마지막 마스크를 재-publish(주기 유지)
         if stamp_key == self.last_stamp_key and self.last_mask_label is not None:
             self._publish_label_and_vis(self.last_mask_label, header, self.mask_pub, self.mask_vis_pub)
+            if self.last_target_label is not None:
+                self._publish_label_and_vis(self.last_target_label, header, self.target_mask_pub, self.target_mask_vis_pub)
             return
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -297,6 +411,8 @@ class GSAMCutieTracker(Node):
         with torch.cuda.amp.autocast(enabled=amp):
             if not self.inited:
                 if not self.objects_to_track:
+                    if self.last_target_label is not None:
+                        self._publish_label_and_vis(self.last_target_label, header, self.target_mask_pub, self.target_mask_vis_pub)
                     return
 
                 init_mask = np.zeros(rgb.shape[:2], dtype=np.int32)
@@ -334,13 +450,13 @@ class GSAMCutieTracker(Node):
         self.last_mask_label = cutie_mask_label
         self._publish_label_and_vis(self.last_mask_label, header, self.mask_pub, self.mask_vis_pub)
 
+        if self._target_instance_id is not None:
+            target_label = (cutie_mask_label == int(self._target_instance_id)).astype(np.int32)
+            self.last_target_label = target_label
 
-    def _publish_mask(self, mask_bin_u8: np.ndarray, header):
-        msg = self.bridge.cv2_to_imgmsg(mask_bin_u8, encoding="rgb8")
-        # Keep stamp/frame_id aligned with the input image.
-        msg.header.stamp = header.stamp
-        msg.header.frame_id = header.frame_id
-        self.mask_pub.publish(msg)
+        if self.last_target_label is not None:
+            self._publish_label_and_vis(self.last_target_label, header, self.target_mask_pub, self.target_mask_vis_pub)
+
 
     def _publish_label_and_vis(self, label: np.ndarray, header, pub_label, pub_vis: Optional[any] = None):
         """Always publish label(32SC1). If pub_vis provided, also publish rgb8 visualization."""
@@ -358,6 +474,7 @@ def main():
         default="",
         help="objects to track; supports JSON/python list string, comma-separated, or single object",
     )
+    parser.add_argument("--prompt", type=str, default="", help="initial prompt; same handling as /inference/prompt")
     parser.add_argument("--topk", type=int, default=1, help="DINO topk initial box")
     args, _ = parser.parse_known_args()    
 

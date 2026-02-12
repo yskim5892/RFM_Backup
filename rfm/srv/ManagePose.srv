@@ -1,0 +1,8 @@
+# Request
+string cmd # "save", "list", "delete", "rename"
+string name # pose name (optional based on cmd)
+---
+# Response
+bool success
+string message
+string[] pose_names # for "list" command
