@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
+from collections import deque
 from pathlib import Path
 import threading
-import json
-import ast
 
 import cv2
 import numpy as np
@@ -17,6 +16,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image as RosImage
 from std_msgs.msg import String as RosString
 from std_msgs.msg import Header as RosHeader
+from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
 
 # GSAM = GroundingDINO + SAM
@@ -27,8 +27,7 @@ from segment_anything import sam_model_registry, SamPredictor
 from cutie.inference.inference_core import InferenceCore
 from cutie.utils.get_default_model import get_default_model
 
-from utils import label_to_rgb
-from std_srvs.srv import Trigger
+import utils
 
 
 def load_gsam(gd_config: str, gd_ckpt: str, sam_ckpt: str, device: str = "cuda"):
@@ -104,7 +103,6 @@ def gsam_make_mask(
 
     return mask
 
-
 # -------------------------
 # ROS2 노드: 첫 프레임 GSAM init → Cutie tracking → 15Hz publish
 # -------------------------
@@ -117,27 +115,29 @@ class GSAMCutieTracker(Node):
         here = Path(__file__).resolve().parent / "thirdparty" / "Grounded-Segment-Anything"
 
         self.declare_parameter("publish_rate", 15.0)
-        self.declare_parameter("device", "cuda")
         self.declare_parameter("box_threshold", 0.35)
         self.declare_parameter("text_threshold", 0.25)
         self.declare_parameter("max_internal_size", 480)
         
         self.image_topic = "/wrist_cam/camera/color/image_raw"
+
         self.mask_topic = "/perception/instance_mask"
-        self.init_mask_topic = "/perception/initial_mask"
         self.mask_vis_topic = "/perception/instance_mask_vis"
+        self.init_mask_topic = "/perception/initial_mask"
         self.init_mask_vis_topic = "/perception/initial_mask_vis"
-        self.objects_to_track_topic = "/inference/objects_to_track"
-        self.prompt_topic = "/inference/prompt"
         self.target_mask_topic = "/perception/target_object_mask"
         self.target_mask_vis_topic = "/perception/target_object_mask_vis"
-        self.pose_reset_srv = "/pose_tracker/reset"
+
+        self.objects_to_track_topic = "/inference/objects_to_track"
+        self.prompt_topic = "/inference/prompt"
+        self.prompt_dequeue_srv = "/perception/dequeue_prompt"
         self._img_lock = threading.Lock()
 
-        device = self.get_parameter("device").value
-        if device.startswith("cuda") and not torch.cuda.is_available():
+        if not torch.cuda.is_available():
             self.get_logger().warning("CUDA not available -> fallback to cpu")
             device = "cpu"
+        else:
+            device = "cuda"
 
         self.box_th = float(self.get_parameter("box_threshold").value)
         self.text_th = float(self.get_parameter("text_threshold").value)
@@ -155,27 +155,18 @@ class GSAMCutieTracker(Node):
         self.target_mask_pub = self.create_publisher(RosImage, self.target_mask_topic, 10)
         self.target_mask_vis_pub = self.create_publisher(RosImage, self.target_mask_vis_topic, 10)
 
-        self.prompt_sub = self.create_subscription(
-            RosString, self.prompt_topic, self._on_prompt, 10
-        )
+        self.prompt_sub = self.create_subscription(RosString, self.prompt_topic, self._on_prompt, 10)
+        self.prompt_dequeue_server = self.create_service(Trigger, self.prompt_dequeue_srv, self._on_prompt_dequeue)
 
-        self.pose_reset_cli = self.create_client(Trigger, self.pose_reset_srv)
-
-        self.objects_to_track_sub = self.create_subscription(
-            RosString, self.objects_to_track_topic, self._on_objects_to_track, 10
-        )
+        self.objects_to_track_sub = self.create_subscription(RosString, self.objects_to_track_topic, self._on_objects_to_track, 10)
 
         self.objects_to_track = []
 
-        self.last_bgr = None
-        self.last_header = None
-        self.last_stamp_key = None
-        self.last_mask_label = None
-        self.init_mask_label = None
-        self.last_target_label = None
-        self._pending_target_text = None
-        self._active_target_text = None
-        self._target_instance_id = None
+        self.last_bgr, self.last_header, self.last_stamp_key, self.last_mask = None, None, None, None
+        self.last_target_mask = None
+        self._prompt_queue: deque[str] = deque()
+        self._target_text: Optional[str] = None
+        self._target_instance_id: Optional[int] = None
 
         # load GSAM once
         self.declare_parameter("gd_config", str(here / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"))
@@ -205,125 +196,82 @@ class GSAMCutieTracker(Node):
             f"sub: {self.image_topic}, pub: {self.mask_topic, self.init_mask_topic}, "
             f"objects_to_track_topic: '{self.objects_to_track_topic}', objects={self.objects_to_track}, device: {self.dev}"
         )
-
-    @staticmethod
-    def _parse_objects_to_track(raw_text: str) -> list[str]:
-        text = (raw_text or "").strip()
-        if not text:
-            return []
-
-        # 1) JSON list
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
-        except Exception:
-            pass
-
-        # 2) Python literal list
-        try:
-            parsed = ast.literal_eval(text)
-            if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
-        except Exception:
-            pass
-
-        # 3) comma or whitespace separated
-        if "," in text:
-            return [x.strip() for x in text.split(",") if x.strip()]
-        if " " in text:
-            return [x.strip() for x in text.split() if x.strip()]
-
-        # 4) single object string
-        return [text]
     
     @staticmethod
-    def _make_imgmsg_32sc1(label: np.ndarray, header) -> RosImage:
-        """label: (H,W) int32, encoding=32SC1"""
-        if label.dtype != np.int32:
-            label = label.astype(np.int32)
-        h, w = label.shape[:2]
-        msg = RosImage()
-        # IMPORTANT: stamp/frame_id must match the input image header.
-        # Do not assign the header object directly (avoid accidental stamp drift).
-        msg.header.stamp = header.stamp
-        msg.header.frame_id = header.frame_id
-        msg.height, msg.width = int(h), int(w)
-        msg.encoding = "32SC1"
-        msg.is_bigendian = False
-        msg.step = int(w * 4)  # int32 = 4 bytes
-        msg.data = label.tobytes()
-        return msg
-
-    @staticmethod
-    def _make_imgmsg_rgb8(rgb: np.ndarray, header) -> RosImage:
-        """rgb: (H,W,3) uint8, encoding=rgb8"""
-        if rgb.dtype != np.uint8:
-            rgb = rgb.astype(np.uint8)
-        h, w = rgb.shape[:2]
-        msg = RosImage()
-        # IMPORTANT: stamp/frame_id must match the input image header.
-        msg.header.stamp = header.stamp
-        msg.header.frame_id = header.frame_id
-        msg.height = int(h)
-        msg.width = int(w)
-        msg.encoding = "rgb8"
-        msg.is_bigendian = False
-        msg.step = int(w * 3)
-        msg.data = rgb.tobytes()
-        return msg
-
-    @staticmethod
-    def _parse_prompt_to_object(prompt: str) -> str:
+    def _parse_prompt_target(prompt: str) -> Optional[tuple[Optional[str], Optional[int]]]:
         text = (prompt or "").strip()
-        if not text:
-            return ""
         parts = text.split()
-        if len(parts) <= 1:
-            return ""
-        return " ".join(parts[1:]).strip()
+        if len(parts) < 2:
+            return None
+
+        second = parts[1]
+        if second.isdigit():
+            return None, int(second)
+
+        target_text = " ".join(parts[1:]).strip()
+        if not target_text:
+            return None
+        return target_text, None
+
+    def _has_active_target(self) -> bool:
+        return self._target_text is not None or self._target_instance_id is not None
 
     @staticmethod
-    def _normalize_object_name(text: str) -> str:
-        return (text or "").strip().lower().replace(" ", "_")
-
-    def _resolve_target_instance_id(self, target_text: str) -> Optional[int]:
-        target_norm = self._normalize_object_name(target_text)
-        if not target_norm:
+    def _infer_instance_id(cutie_mask: np.ndarray, target_mask: Optional[np.ndarray]) -> Optional[int]:
+        if target_mask is None:
             return None
-        for instance_id, obj_name in enumerate(self.objects_to_track, start=1):
-            if self._normalize_object_name(obj_name) == target_norm:
-                return instance_id
-        return None
+        fg = target_mask > 0
+        if not np.any(fg):
+            return None
+        candidates = cutie_mask[fg]
+        candidates = candidates[candidates > 0]
+        if candidates.size == 0:
+            return None
+        ids, counts = np.unique(candidates, return_counts=True)
+        return int(ids[np.argmax(counts)])
 
     def _on_prompt(self, msg: RosString):
-        obj = self._parse_prompt_to_object(msg.data)
-        if not obj:
-            self.get_logger().warning(f"prompt parse failed: '{msg.data}'")
+        prompt = (msg.data or "").strip()
+        if not prompt:
+            self.get_logger().warning("empty prompt ignored")
             return
-        self._active_target_text = obj
-        self._target_instance_id = self._resolve_target_instance_id(obj)
-        self.last_target_label = None
-        self._pending_target_text = obj
-        if self._target_instance_id is None:
-            self.get_logger().info(f"prompt -> target object: '{obj}' (no objects_to_track id match)")
-        else:
-            self.get_logger().info(f"prompt -> target object: '{obj}' (instance_id={self._target_instance_id})")
+        self._prompt_queue.append(prompt)
+        self.get_logger().info(f"prompt queued: '{prompt}' (queue={len(self._prompt_queue)})")
+        self._activate_next_prompt()
 
-    def _call_pose_reset_async(self):
-        if not self.pose_reset_cli.wait_for_service(timeout_sec=0.2):
-            self.get_logger().warning(f"{self.pose_reset_srv} service not available")
+    def _activate_next_prompt(self):
+        if self._has_active_target():
             return
-        req = Trigger.Request()
-        fut = self.pose_reset_cli.call_async(req)
-        fut.add_done_callback(self._on_pose_reset_done)
+        while self._prompt_queue:
+            parsed = self._parse_prompt_target(self._prompt_queue[0])
+            if parsed is None:
+                dropped = self._prompt_queue.popleft()
+                self.get_logger().warning(f"invalid prompt dropped: '{dropped}'")
+                continue
 
-    def _on_pose_reset_done(self, fut):
-        try:
-            res = fut.result()
-            self.get_logger().info(f"pose reset: success={res.success}, msg='{res.message}'")
-        except Exception as e:
-            self.get_logger().warning(f"pose reset call failed: {e}")
+            self._target_text, self._target_instance_id = parsed
+            self.last_target_mask = None
+            if self._target_instance_id is None:
+                self.get_logger().info(f"prompt -> target text: '{self._target_text}'")
+            else:
+                self.get_logger().info(f"prompt -> target instance_id={self._target_instance_id}")
+            return
+
+    def _on_prompt_dequeue(self, _req, resp):
+        if not self._prompt_queue:
+            resp.success = False
+            resp.message = "prompt queue is empty"
+            return resp
+
+        finished = self._prompt_queue.popleft()
+        self.get_logger().info(f"prompt dequeued: '{finished}' (queue={len(self._prompt_queue)})")
+        self._target_text = None
+        self._target_instance_id = None
+        self.last_target_mask = None
+        self._activate_next_prompt()
+        resp.success = True
+        resp.message = f"dequeued '{finished}'"
+        return resp
 
     def _on_image(self, msg: RosImage):
         bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -337,30 +285,15 @@ class GSAMCutieTracker(Node):
             self.last_bgr = bgr
 
     def _on_objects_to_track(self, msg: RosString):
-        objs = self._parse_objects_to_track(msg.data)
+        objs = utils.parse_objects_to_track(msg.data)
         self.objects_to_track = objs
         self.get_logger().info(f"objects_to_track updated: {self.objects_to_track}")
-        if self._active_target_text:
-            self._target_instance_id = self._resolve_target_instance_id(self._active_target_text)
-            if self._target_instance_id is None:
-                self.get_logger().info(
-                    f"active target '{self._active_target_text}' not found in objects_to_track; "
-                    "target mask will use last GSAM result."
-                )
-            else:
-                self.get_logger().info(
-                    f"active target '{self._active_target_text}' mapped to instance_id={self._target_instance_id}"
-                )
         self.inited = False
-        self.last_stamp_key = None
-
-        self.last_mask_label = None
-        self.init_mask_label = None
+        self.last_stamp_key, self.last_mask = None, None
 
         # 2) Cutie 메모리 완전 리셋: InferenceCore 재생성
         self.processor = InferenceCore(self.cutie, cfg=self.cutie.cfg)
         self.processor.max_internal_size = int(self.get_parameter("max_internal_size").value)
-
 
     @torch.inference_mode()
     def _on_timer(self):
@@ -370,51 +303,25 @@ class GSAMCutieTracker(Node):
             header = self.last_header
             bgr = self.last_bgr.copy()
 
-        # prompt 기반 타겟 마스크(단일) 생성/발행
-        if self._pending_target_text is not None:
-            target = self._pending_target_text
-            self._pending_target_text = None
-
-            single_mask = gsam_make_mask(
-                bgr, target, self.gd_model, self.gd_transform,
-                self.sam_predictor, self.dev, topk=1,
-                box_threshold=self.box_th, text_threshold=self.text_th,
-            )
-            target_label = (single_mask > 0).astype(np.int32)
-            self.last_target_label = target_label
-            self._publish_label_and_vis(
-                target_label, header, self.target_mask_pub, self.target_mask_vis_pub
-            )
-
-            if target_label.sum() == 0:
-                self.get_logger().warning(f"target mask empty for '{target}'")
-            else:
-                self.get_logger().info(f"published target mask for '{target}'")
-
-            self._call_pose_reset_async()
-
         stamp = header.stamp
         stamp_key = (int(stamp.sec), int(stamp.nanosec))
 
         # 새 프레임이 없으면 마지막 마스크를 재-publish(주기 유지)
-        if stamp_key == self.last_stamp_key and self.last_mask_label is not None:
-            self._publish_label_and_vis(self.last_mask_label, header, self.mask_pub, self.mask_vis_pub)
-            if self.last_target_label is not None:
-                self._publish_label_and_vis(self.last_target_label, header, self.target_mask_pub, self.target_mask_vis_pub)
+        if stamp_key == self.last_stamp_key and self.last_mask is not None:
+            self._publish_label_and_vis(self.last_mask, header, self.mask_pub, self.mask_vis_pub)
+            if self.last_target_mask is not None:
+                self._publish_label_and_vis(self.last_target_mask, header, self.target_mask_pub, self.target_mask_vis_pub)
             return
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
         image_tensor = torch.from_numpy(rgb).to(self.dev).permute(2, 0, 1).contiguous().float() / 255.0
 
         amp = (self.dev.type == "cuda")
+        # initialized되지 않았으면 gsam으로 초기 마스크 1회 생성, 이후 프레임부터는 Cutie로 추적
         with torch.cuda.amp.autocast(enabled=amp):
             if not self.inited:
-                if not self.objects_to_track:
-                    if self.last_target_label is not None:
-                        self._publish_label_and_vis(self.last_target_label, header, self.target_mask_pub, self.target_mask_vis_pub)
+                if len(self.objects_to_track) == 0:
                     return
-
                 init_mask = np.zeros(rgb.shape[:2], dtype=np.int32)
                 for instance_id, obj_name in enumerate(self.objects_to_track, start=1):
                     single_mask = gsam_make_mask(
@@ -424,13 +331,7 @@ class GSAMCutieTracker(Node):
                     )
                     init_mask[single_mask > 0] = instance_id
                 init_mask = init_mask.astype(np.int32)
-                self.init_mask_label = init_mask
-                self._publish_label_and_vis(self.init_mask_label, header, self.init_mask_pub, self.init_mask_vis_pub)
-
-                if init_mask.sum() == 0:
-                    self.get_logger().warning("GSAM init mask is empty. (objects_to_track/threshold 확인)")
-                    self.last_stamp_key = stamp_key
-                    return
+                self._publish_label_and_vis(init_mask, header, self.init_mask_pub, self.init_mask_vis_pub)
 
                 init_mask_tensor = torch.from_numpy(init_mask).to(self.dev)
                 obj_ids = list(range(1, int(init_mask.max()) + 1))
@@ -439,41 +340,51 @@ class GSAMCutieTracker(Node):
                 self.inited = True
             else:
                 output_prob = self.processor.step(image_tensor)
-                if self.init_mask_label is not None:
-                    self._publish_label_and_vis(self.init_mask_label, header,
-                                                self.init_mask_pub, self.init_mask_vis_pub)
 
             cutie_mask = self.processor.output_prob_to_mask(output_prob)  # (H,W), 0/1/...
-            cutie_mask_label = cutie_mask.detach().cpu().numpy().astype(np.int32)
+            cutie_mask = cutie_mask.detach().cpu().numpy().astype(np.int32)
 
         self.last_stamp_key = stamp_key
-        self.last_mask_label = cutie_mask_label
-        self._publish_label_and_vis(self.last_mask_label, header, self.mask_pub, self.mask_vis_pub)
+        self.last_mask = cutie_mask
+        self._publish_label_and_vis(self.last_mask, header, self.mask_pub, self.mask_vis_pub)
 
+        # prompt 기반 타겟 마스크(단일) 생성/발행: text 기반 GSAM 1회 수행
+        if self._target_text is not None and self.last_target_mask is None:
+            target = self._target_text
+            single_mask = gsam_make_mask(
+                bgr, target, self.gd_model, self.gd_transform,
+                self.sam_predictor, self.dev, topk=1,
+                box_threshold=self.box_th, text_threshold=self.text_th,
+            )
+            target_mask = (single_mask > 0).astype(np.int32)
+            inferred_id = self._infer_instance_id(cutie_mask, target_mask)
+            if inferred_id is not None:
+                self._target_instance_id = inferred_id
+                self.get_logger().info(f"target instance locked: {self._target_instance_id}")
+            self.last_target_mask = target_mask
+
+        # target instance id 기반 타겟 마스크 생성/발행
         if self._target_instance_id is not None:
-            target_label = (cutie_mask_label == int(self._target_instance_id)).astype(np.int32)
-            self.last_target_label = target_label
+            target_mask = (cutie_mask == int(self._target_instance_id)).astype(np.int32)
+            self.last_target_mask = target_mask
 
-        if self.last_target_label is not None:
-            self._publish_label_and_vis(self.last_target_label, header, self.target_mask_pub, self.target_mask_vis_pub)
-
+        if target_mask.sum() == 0:
+            self.get_logger().warning(f"target mask empty for '{target}'")
+        else:
+            self.get_logger().info(f"published target mask for '{target}'")
+        self._publish_label_and_vis(self.last_target_mask, header, self.target_mask_pub, self.target_mask_vis_pub)
 
     def _publish_label_and_vis(self, label: np.ndarray, header, pub_label, pub_vis: Optional[any] = None):
         """Always publish label(32SC1). If pub_vis provided, also publish rgb8 visualization."""
-        pub_label.publish(self._make_imgmsg_32sc1(label, header))
+        pub_label.publish(utils.make_imgmsg_32sc1(label, header))
         if pub_vis is not None:
-            rgb = label_to_rgb(label.astype(np.int32))
-            pub_vis.publish(self._make_imgmsg_rgb8(rgb, header))
+            rgb = utils.label_to_rgb(label.astype(np.int32))
+            pub_vis.publish(utils.make_imgmsg_rgb8(rgb, header))
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--objects_to_track",
-        type=str,
-        default="",
-        help="objects to track; supports JSON/python list string, comma-separated, or single object",
-    )
+    parser.add_argument("--objects_to_track", type=str, default="", help="objects to track; supports JSON/python list string, comma-separated, or single object")
     parser.add_argument("--prompt", type=str, default="", help="initial prompt; same handling as /inference/prompt")
     parser.add_argument("--topk", type=int, default=1, help="DINO topk initial box")
     args, _ = parser.parse_known_args()    
@@ -485,7 +396,6 @@ def main():
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()

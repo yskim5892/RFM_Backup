@@ -7,3 +7,4 @@ rfm/install*
 rfm/build*
 rfm/log*
 rfm/weights
+log/
