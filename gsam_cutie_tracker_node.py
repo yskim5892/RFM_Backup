@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from collections import deque
+import json
 from pathlib import Path
 import threading
 
@@ -8,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 from torchvision.ops import box_convert
-from typing import Optional
+from typing import Optional, Union
 
 import rclpy
 from rclpy.node import Node
@@ -55,7 +56,10 @@ def gsam_make_mask(
     topk: int = 1,
     box_threshold: float = 0.35,
     text_threshold: float = 0.25,
-) -> np.ndarray:
+    score_threshold: float = 0.0,
+    relative_score_threshold: float = 0.0,
+    return_scores: bool = False,
+) -> Union[np.ndarray, tuple[np.ndarray, list[float]]]:
 
     caption = prompt.strip()
     if not caption.endswith("."):
@@ -77,16 +81,32 @@ def gsam_make_mask(
     )
 
     if boxes is None or logits is None or len(boxes) == 0 or len(logits) == 0:
-        return np.zeros((h, w), dtype=np.uint8)
+        empty = np.zeros((h, w), dtype=np.int32)
+        return (empty, []) if return_scores else empty
 
-    k = max(1, int(topk))
-    idx = torch.argsort(logits, descending=True)[:k]
-    if idx.numel() == 0:
-        return np.zeros((h, w), dtype=np.uint8)
+    logits = logits.flatten()
+    order = torch.argsort(logits, descending=True)
+    if order.numel() == 0:
+        empty = np.zeros((h, w), dtype=np.int32)
+        return (empty, []) if return_scores else empty
 
+    best = float(logits[order[0]].item())
+    keep = logits[order] >= float(score_threshold)
+    if float(relative_score_threshold) > 0.0:
+        keep = keep & (logits[order] >= best * float(relative_score_threshold))
+
+    order = order[keep]
+    if order.numel() == 0:
+        empty = np.zeros((h, w), dtype=np.int32)
+        return (empty, []) if return_scores else empty
+
+    k = int(max(1, topk))
+    idx = order[:k]
     boxes = boxes[idx]
+    sel_scores = logits[idx]
     if len(boxes) == 0:
-        return np.zeros((h, w), dtype=np.uint8)
+        empty = np.zeros((h, w), dtype=np.int32)
+        return (empty, []) if return_scores else empty
 
     # GroundingDINO boxes: normalized cxcywh -> pixel xyxy
     scale = torch.tensor([w, h, w, h], device=boxes.device, dtype=boxes.dtype)
@@ -101,6 +121,8 @@ def gsam_make_mask(
         m, _, _ = sam_predictor.predict(box=b.detach().cpu().numpy(), multimask_output=False)
         mask[m[0].astype(bool)] = i
 
+    if return_scores:
+        return mask, sel_scores.detach().cpu().tolist()
     return mask
 
 # -------------------------
@@ -127,6 +149,7 @@ class GSAMCutieTracker(Node):
         self.init_mask_vis_topic = "/perception/initial_mask_vis"
         self.target_mask_topic = "/perception/target_object_mask"
         self.target_mask_vis_topic = "/perception/target_object_mask_vis"
+        self.instance_objects_topic = "/perception/instance_objects"
 
         self.objects_to_track_topic = "/inference/objects_to_track"
         self.prompt_topic = "/inference/prompt"
@@ -154,6 +177,7 @@ class GSAMCutieTracker(Node):
         self.init_mask_vis_pub = self.create_publisher(RosImage, self.init_mask_vis_topic, 10)   
         self.target_mask_pub = self.create_publisher(RosImage, self.target_mask_topic, 10)
         self.target_mask_vis_pub = self.create_publisher(RosImage, self.target_mask_vis_topic, 10)
+        self.instance_objects_pub = self.create_publisher(RosString, self.instance_objects_topic, 10)
 
         self.prompt_sub = self.create_subscription(RosString, self.prompt_topic, self._on_prompt, 10)
         self.prompt_dequeue_server = self.create_service(Trigger, self.prompt_dequeue_srv, self._on_prompt_dequeue)
@@ -164,6 +188,7 @@ class GSAMCutieTracker(Node):
 
         self.last_bgr, self.last_header, self.last_stamp_key, self.last_mask = None, None, None, None
         self.last_target_mask = None
+        self.instance_objects = [""]
         self._prompt_queue: deque[str] = deque()
         self._target_text: Optional[str] = None
         self._target_instance_id: Optional[int] = None
@@ -288,6 +313,8 @@ class GSAMCutieTracker(Node):
         objs = utils.parse_objects_to_track(msg.data)
         self.objects_to_track = objs
         self.get_logger().info(f"objects_to_track updated: {self.objects_to_track}")
+        self.instance_objects = [""]
+        self._publish_instance_objects()
         self.inited = False
         self.last_stamp_key, self.last_mask = None, None
 
@@ -307,11 +334,13 @@ class GSAMCutieTracker(Node):
         stamp_key = (int(stamp.sec), int(stamp.nanosec))
 
         # 새 프레임이 없으면 마지막 마스크를 재-publish(주기 유지)
-        if stamp_key == self.last_stamp_key and self.last_mask is not None:
-            self._publish_label_and_vis(self.last_mask, header, self.mask_pub, self.mask_vis_pub)
+        if stamp_key == self.last_stamp_key:
+            if self.last_mask is not None:
+                self._publish_label_and_vis(self.last_mask, header, self.mask_pub, self.mask_vis_pub)
             if self.last_target_mask is not None:
                 self._publish_label_and_vis(self.last_target_mask, header, self.target_mask_pub, self.target_mask_vis_pub)
-            return
+            if self.last_mask is not None or self.last_target_mask is not None:
+                return
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         image_tensor = torch.from_numpy(rgb).to(self.dev).permute(2, 0, 1).contiguous().float() / 255.0
@@ -320,21 +349,36 @@ class GSAMCutieTracker(Node):
         # initialized되지 않았으면 gsam으로 초기 마스크 1회 생성, 이후 프레임부터는 Cutie로 추적
         with torch.cuda.amp.autocast(enabled=amp):
             if not self.inited:
-                if len(self.objects_to_track) == 0:
-                    return
                 init_mask = np.zeros(rgb.shape[:2], dtype=np.int32)
-                for instance_id, obj_name in enumerate(self.objects_to_track, start=1):
-                    single_mask = gsam_make_mask(
+                next_id = 1
+                instance_objects = [""]
+                for obj_name in self.objects_to_track:
+                    single_mask, scores = gsam_make_mask(
                         bgr, obj_name, self.gd_model, self.gd_transform,
-                        self.sam_predictor, self.dev, self.args.topk,
+                        self.sam_predictor, self.dev,
+                        topk=self.args.topk,
                         box_threshold=self.box_th, text_threshold=self.text_th,
+                        score_threshold=self.args.score_th,
+                        relative_score_threshold=self.args.rel_score_th,
+                        return_scores=True,
                     )
-                    init_mask[single_mask > 0] = instance_id
+                    self.get_logger().info(f"[{obj_name}] kept scores={scores}")
+                    k = int(single_mask.max())
+                    for local_id in range(1, k + 1):
+                        score = float(scores[local_id - 1]) if local_id - 1 < len(scores) else float("nan")
+                        self.get_logger().info(
+                            f"id assigned: {next_id} -> '{obj_name}' (local_id={local_id}, score={score:.4f})"
+                        )
+                        instance_objects.append(obj_name)
+                        init_mask[single_mask == local_id] = next_id
+                        next_id += 1
+                self.instance_objects = instance_objects
+                self._publish_instance_objects()
                 init_mask = init_mask.astype(np.int32)
                 self._publish_label_and_vis(init_mask, header, self.init_mask_pub, self.init_mask_vis_pub)
 
                 init_mask_tensor = torch.from_numpy(init_mask).to(self.dev)
-                obj_ids = list(range(1, int(init_mask.max()) + 1))
+                obj_ids = list(range(1, next_id))
 
                 output_prob = self.processor.step(image_tensor, init_mask_tensor, objects=obj_ids)
                 self.inited = True
@@ -347,32 +391,42 @@ class GSAMCutieTracker(Node):
         self.last_stamp_key = stamp_key
         self.last_mask = cutie_mask
         self._publish_label_and_vis(self.last_mask, header, self.mask_pub, self.mask_vis_pub)
+        self._publish_instance_objects()
 
-        # prompt 기반 타겟 마스크(단일) 생성/발행: text 기반 GSAM 1회 수행
-        if self._target_text is not None and self.last_target_mask is None:
-            target = self._target_text
-            single_mask = gsam_make_mask(
-                bgr, target, self.gd_model, self.gd_transform,
-                self.sam_predictor, self.dev, topk=1,
-                box_threshold=self.box_th, text_threshold=self.text_th,
-            )
-            target_mask = (single_mask > 0).astype(np.int32)
-            inferred_id = self._infer_instance_id(cutie_mask, target_mask)
-            if inferred_id is not None:
-                self._target_instance_id = inferred_id
-                self.get_logger().info(f"target instance locked: {self._target_instance_id}")
-            self.last_target_mask = target_mask
+        if self._has_active_target():
+            target_mask = self.last_target_mask
+            target_desc = self._target_text if self._target_text is not None else f"id={self._target_instance_id}"
 
-        # target instance id 기반 타겟 마스크 생성/발행
-        if self._target_instance_id is not None:
-            target_mask = (cutie_mask == int(self._target_instance_id)).astype(np.int32)
-            self.last_target_mask = target_mask
+            # prompt 기반 타겟 마스크(단일) 생성/발행: text 기반 GSAM 1회 수행
+            if self._target_text is not None and self.last_target_mask is None:
+                single_mask = gsam_make_mask(
+                    bgr, self._target_text, self.gd_model, self.gd_transform,
+                    self.sam_predictor, self.dev, topk=1,
+                    box_threshold=self.box_th, text_threshold=self.text_th,
+                )
+                target_mask = (single_mask > 0).astype(np.int32)
+                inferred_id = self._infer_instance_id(cutie_mask, target_mask)
+                if inferred_id is not None:
+                    self._target_instance_id = inferred_id
+                    target_desc = f"id={self._target_instance_id}"
+                    self.get_logger().info(f"target instance locked: {self._target_instance_id}")
+                self.last_target_mask = target_mask
 
-        if target_mask.sum() == 0:
-            self.get_logger().warning(f"target mask empty for '{target}'")
-        else:
-            self.get_logger().info(f"published target mask for '{target}'")
-        self._publish_label_and_vis(self.last_target_mask, header, self.target_mask_pub, self.target_mask_vis_pub)
+            # target instance id 기반 타겟 마스크 생성/발행
+            if self._target_instance_id is not None:
+                target_mask = (cutie_mask == int(self._target_instance_id)).astype(np.int32)
+                self.last_target_mask = target_mask
+                target_desc = f"id={self._target_instance_id}"
+
+            if target_mask is not None:
+                if int(target_mask.sum()) == 0:
+                    self.get_logger().warning(f"target mask empty for '{target_desc}'")
+                self._publish_label_and_vis(target_mask, header, self.target_mask_pub, self.target_mask_vis_pub)
+
+    def _publish_instance_objects(self):
+        msg = RosString()
+        msg.data = json.dumps(self.instance_objects)
+        self.instance_objects_pub.publish(msg)
 
     def _publish_label_and_vis(self, label: np.ndarray, header, pub_label, pub_vis: Optional[any] = None):
         """Always publish label(32SC1). If pub_vis provided, also publish rgb8 visualization."""
@@ -387,6 +441,8 @@ def main():
     parser.add_argument("--objects_to_track", type=str, default="", help="objects to track; supports JSON/python list string, comma-separated, or single object")
     parser.add_argument("--prompt", type=str, default="", help="initial prompt; same handling as /inference/prompt")
     parser.add_argument("--topk", type=int, default=1, help="DINO topk initial box")
+    parser.add_argument("--score_th", type=float, default=0.0, help="min DINO logit to keep (absolute)")
+    parser.add_argument("--rel_score_th", type=float, default=0.85, help="keep boxes with score >= best*rel_score_th (0 disables)")
     args, _ = parser.parse_known_args()    
 
     rclpy.init()

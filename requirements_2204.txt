@@ -1,0 +1,30 @@
+# FoundationPose on Ubuntu 22.04 / Python 3.10 / CUDA 11.8 (tested set)
+# Use inside a clean venv, then run ./setup_2204.sh
+
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.2.2+cu118
+torchvision==0.17.2+cu118
+torchaudio==2.2.2+cu118
+
+numpy==1.26.4
+scipy==1.15.3
+opencv-python==4.11.0.86
+imageio==2.37.2
+trimesh==4.11.1
+open3d==0.19.0
+omegaconf==2.3.0
+ruamel.yaml==0.19.1
+PyYAML==6.0.3
+pandas==2.3.3
+matplotlib==3.10.8
+Pillow==12.0.0
+scikit-image==0.25.2
+scikit-learn==1.7.2
+joblib==1.5.3
+tqdm==4.67.2
+kornia==0.8.2
+nvdiffrast==0.4.0
+pytorch3d==0.7.8
+transformations==2025.1.1
+psutil==7.2.2
+h5py==3.15.1

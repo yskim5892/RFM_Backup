@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import socket
 import time
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -11,6 +11,8 @@ class RobotiqGripper:
     port: int = 63352
     timeout: float = 0.3          # 짧게: 응답 없는 커맨드에서 오래 안 기다리게
     recv_bytes: int = 4096
+    activate_timeout_s: float = 2.0
+    _activated: bool = field(default=False, init=False, repr=False)
 
     # ---- low-level ----
     def _send(self, cmd: str, expect_reply: bool) -> Optional[str]:
@@ -33,6 +35,24 @@ class RobotiqGripper:
             if not data:
                 return None
             return data.decode("ascii", errors="ignore").strip()
+
+    def _get_var(self, key: str) -> Optional[int]:
+        """
+        Parse integer reply for "GET <key>".
+        Robust to multi-token replies like "... POS 123 ...".
+        """
+        resp = self._send(f"GET {key}", expect_reply=True)
+        if not resp:
+            return None
+        tokens = resp.replace("\r", " ").replace("\n", " ").split()
+        k = key.upper()
+        for i in range(len(tokens) - 1):
+            if tokens[i].upper() == k:
+                try:
+                    return int(tokens[i + 1])
+                except ValueError:
+                    return None
+        return None
 
     def wait_until_stopped(self, timeout_s: float = 5.0, poll_dt: float = 0.05,
                            stable_time: float = 0.2, eps: int = 1) -> bool:
@@ -72,21 +92,64 @@ class RobotiqGripper:
 
     def get_pos(self) -> Optional[int]:
         """Return position as int [0..255] if parseable."""
-        resp = self.get_pos_raw()
-        if not resp:
-            return None
-        parts = resp.split()
-        if len(parts) == 2 and parts[0].upper() == "POS":
-            try:
-                return int(parts[1])
-            except ValueError:
-                return None
-        return None
+        return self._get_var("POS")
+
+    def get_status(self) -> Optional[int]:
+        """Robotiq STA (typically: 0=reset, 1=activating, 3=active)."""
+        return self._get_var("STA")
+
+    def get_object_status(self) -> Optional[int]:
+        """Robotiq OBJ status (object detection / motion state)."""
+        return self._get_var("OBJ")
+
+    def get_fault(self) -> Optional[int]:
+        """Robotiq FLT fault code."""
+        return self._get_var("FLT")
+
+    def wait_until_active(self, timeout_s: Optional[float] = None, poll_dt: float = 0.05) -> bool:
+        t0 = time.time()
+        deadline = timeout_s if timeout_s is not None else self.activate_timeout_s
+        while time.time() - t0 < deadline:
+            sta = self.get_status()
+            if sta == 3:
+                return True
+            time.sleep(poll_dt)
+        return False
 
     # ---- commands (fire-and-forget by default) ----
-    def activate(self) -> None:
-        # Many URCap servers don't reply to ACT; so don't expect reply.
+    def activate(self, force: bool = False) -> bool:
+        """
+        Activate gripper in a protocol-compatible way.
+        - Legacy servers: "ACT"
+        - Robotiq socket protocol: "SET ACT 1" + "SET GTO 1"
+        """
+        if self._activated and not force:
+            return True
+
+        sta = self.get_status()
+        if sta == 3:
+            self._activated = True
+            # Ensure go-to mode in case controller rebooted.
+            self._send("SET GTO 1", expect_reply=False)
+            return True
+
+        # Some environments only support one variant. Send both safely.
+        self._send("SET ACT 1", expect_reply=False)
+        self._send("SET GTO 1", expect_reply=False)
         self._send("ACT", expect_reply=False)
+        self._send("SET GTO 1", expect_reply=False)
+
+        # Prefer explicit activation check when supported.
+        if self.wait_until_active(timeout_s=self.activate_timeout_s):
+            self._activated = True
+            return True
+
+        # Fallback: if POS can be read, communication is alive.
+        if self.get_pos() is not None:
+            self._activated = True
+            return True
+
+        return False
 
     def set_speed(self, speed: int) -> None:
         speed = max(0, min(255, int(speed)))
@@ -102,6 +165,9 @@ class RobotiqGripper:
         Move to pos (0=open .. 255=close typical).
         Returns True if reached within tol (when wait=True), else False.
         """
+        if not self.activate():
+            raise RuntimeError("Robotiq gripper activation failed before motion command")
+
         pos = max(0, min(255, int(pos)))
 
         # Optional params first
@@ -120,12 +186,12 @@ class RobotiqGripper:
 
     def open(self, speed: int = 255, force: int = 255, wait: bool = True,
              tol: int = 3, timeout_s: float = 5.0) -> bool:
-        self.activate()  # harmless even if already active
         return self.goto(0, speed=speed, force=force, wait=wait, tol=tol, timeout_s=timeout_s)
 
     def close(self, speed: int = 255, force: int = 255, wait: bool = True,
               tol: int = 3, timeout_s: float = 5.0) -> bool:
-        self.activate()
+        if not self.activate():
+            raise RuntimeError("Robotiq gripper activation failed before motion command")
         self.set_speed(speed)
         self.set_force(force)
         self._send("SET POS 255", expect_reply=False)
@@ -163,4 +229,3 @@ if __name__ == "__main__":
 
     ok = g.goto(80, speed=200, force=40, wait=True)
     print("Goto 80 reached:", ok, "pos:", g.get_pos())
-

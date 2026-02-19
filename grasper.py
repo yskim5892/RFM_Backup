@@ -12,7 +12,7 @@ STATUS_GRASPING = "GRASPING"
 
 GRIPPER_HOST = "192.168.0.43"
 GRIPPER_PORT = 63352
-GRIPPER_TIMEOUT = 0.3
+GRIPPER_TIMEOUT = 0.5
 MOVE_SAVED_WAIT_TIMEOUT = 0.05
 
 class Grasper:
@@ -33,7 +33,8 @@ class Grasper:
                 port=GRIPPER_PORT,
                 timeout=GRIPPER_TIMEOUT,
             )
-            self.gripper.activate()
+            if not self.gripper.activate():
+                raise RuntimeError("gripper activate returned False")
         except Exception as e:
             self.node.get_logger().warning(f"Robotiq gripper init failed: {e}")
 
@@ -72,6 +73,10 @@ class Grasper:
     def _on_grasp_approach_done(self, success: bool, message: str):
         if not success:
             self._set_grasp_sequence_failed(f"approach_failed: {message}")
+            return
+
+        if self.gripper is None:
+            self._set_grasp_sequence_failed("gripper_missing_before_close")
             return
 
         try:

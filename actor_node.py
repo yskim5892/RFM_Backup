@@ -79,10 +79,9 @@ class ActorNode(Node):
         self.ur5_action_wait_timeout = float(self.declare_parameter("ur5_action_wait_timeout", 0.05).value)
 
         self.grasp_depth_threshold_m = float(self.declare_parameter("grasp_depth_threshold_m", 0.4).value)
-        self.grasp_center_dist_px_threshold = float(
-            self.declare_parameter("grasp_center_dist_px_threshold", 25.0).value
-        )
-        self.grasp_center_y_weight = float(self.declare_parameter("grasp_center_y_weight", 0.05).value)
+        self.grasp_center_dist_px_threshold = float(self.declare_parameter("grasp_center_dist_px_threshold", 30.0).value)
+        self.grasp_center_y = float(self.declare_parameter("grasp_center_y", 0.2).value)
+        self.grasp_center_y_weight = float(self.declare_parameter("grasp_center_y_weight", 0.5).value)
 
         strategy_default = str(self.repo_root / "grasp_strategy.json")
         self.grasp_strategy_file = Path(self.declare_parameter("grasp_strategy_file", strategy_default).value)
@@ -179,9 +178,6 @@ class ActorNode(Node):
 
     def _on_prompt(self, msg: String):
         obj_name = utils.parse_prompt_to_object(msg.data)
-        if obj_name is None:
-            self.get_logger().warning(f"Invalid prompt format: '{msg.data}'. Expected: '<verb> <object>'")
-            return
 
         self._prompt_queue.append(obj_name)
         self.get_logger().info(f"Prompt queued: '{obj_name}' (queue={len(self._prompt_queue)})")
@@ -315,7 +311,7 @@ class ActorNode(Node):
         fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
         p_obj_cam = np.array([(u - cx) * z / fx, (v - cy) * z / fy, z], dtype=np.float64)
         dx = u - 0.5 * float(mask.shape[1] - 1)
-        dy = v - 0.5 * float(mask.shape[0] - 1)
+        dy = v - self.grasp_center_y * float(mask.shape[0] - 1)
         center_dist_px = float(np.hypot(dx, self.grasp_center_y_weight * dy))
 
         return p_obj_cam, z, center_dist_px, (int(round(u)), int(round(v)))
@@ -433,7 +429,7 @@ class ActorNode(Node):
         vis = rgb.copy()
         h, w = vis.shape[:2]
         img_cx = 0.5 * float(w - 1)
-        img_cy = 0.5 * float(h - 1)
+        img_cy = self.grasp_center_y * float(h - 1)
         center_px = (int(round(img_cx)), int(round(img_cy)))
 
         mask_u8 = (mask.astype(np.uint8) * 255)
