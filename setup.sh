@@ -58,7 +58,7 @@ fi
 
 echo "[INFO] Installing Python dependencies"
 python -m pip install wheel
-python -m pip install -r "${REPO_ROOT}/requirements_2204.txt"
+python -m pip install -r "${REPO_ROOT}/requirements.txt"
 
 echo "[INFO] Building mycpp (pybind extension)"
 cd "${FP_DIR}/mycpp"
