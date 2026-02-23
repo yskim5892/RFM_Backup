@@ -12,6 +12,8 @@ from torchvision.ops import box_convert
 from typing import Optional, Union
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image as RosImage
@@ -155,6 +157,8 @@ class GSAMCutieTracker(Node):
         self.prompt_topic = "/inference/prompt"
         self.prompt_dequeue_srv = "/perception/dequeue_prompt"
         self._img_lock = threading.Lock()
+        self.cb_group_image = ReentrantCallbackGroup()
+        self.cb_group_timer = MutuallyExclusiveCallbackGroup()
 
         if not torch.cuda.is_available():
             self.get_logger().warning("CUDA not available -> fallback to cpu")
@@ -167,7 +171,7 @@ class GSAMCutieTracker(Node):
 
         # subscribe/publish
         self.sub = self.create_subscription(
-            RosImage, self.image_topic, self._on_image, qos_profile_sensor_data
+            RosImage, self.image_topic, self._on_image, qos_profile_sensor_data, callback_group=self.cb_group_image
         )
         # Object Mask를 Node끼리 주고받을 때는 32C1 (one-hot map)
         # Visualize할 때는 rgb8
@@ -215,7 +219,7 @@ class GSAMCutieTracker(Node):
             self._on_prompt(RosString(data=args.prompt))
 
         hz = float(self.get_parameter("publish_rate").value)
-        self.timer = self.create_timer(1.0 / max(hz, 1e-3), self._on_timer)
+        self.timer = self.create_timer(1.0 / max(hz, 1e-3), self._on_timer, callback_group=self.cb_group_timer)
 
         self.get_logger().info(
             f"sub: {self.image_topic}, pub: {self.mask_topic, self.init_mask_topic}, "
@@ -449,9 +453,12 @@ def main():
 
     rclpy.init()
     node = GSAMCutieTracker(args)
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

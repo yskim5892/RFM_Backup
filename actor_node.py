@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
-import message_filters
 import numpy as np
 import rclpy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
 from rclpy.action import ActionClient
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
@@ -58,6 +59,8 @@ class ActorNode(Node):
         self.min_mask_pixels = int(self.declare_parameter("min_mask_pixels", 200).value)
         self.sync_queue_size = int(self.declare_parameter("sync_queue_size", 30).value)
         self.sync_slop_sec = float(self.declare_parameter("sync_slop_sec", 0.2).value)
+        self.sync_process_hz = float(self.declare_parameter("sync_process_hz", 30.0).value)
+        self.sync_debug = bool(self.declare_parameter("sync_debug", False).value)
         self.tf_lookup_timeout_sec = float(self.declare_parameter("tf_lookup_timeout_sec", 0.1).value)
         self.skip_while_moving = bool(self.declare_parameter("skip_while_moving", False).value)
 
@@ -94,6 +97,9 @@ class ActorNode(Node):
         self.static_tf_publisher = StaticTFPublisher(self)
         self.static_tf_publisher.publish_from_file(matrix_file=self.static_tf_file, parent="tool0", child="camera_link")
 
+        self.cb_group_sync_io = ReentrantCallbackGroup()
+        self.cb_group_sync_timer = MutuallyExclusiveCallbackGroup()
+
         self.pub_T_base_obj = self.create_publisher(PoseStamped, "/pose_tracker/T_base_obj", 10)
         self.pub_T_cam_obj = self.create_publisher(PoseStamped, "/pose_tracker/T_cam_obj", 10)
         self.pub_target_tcp = self.create_publisher(PoseStamped, "/pose_tracker/target_tcp_pose", 10)
@@ -106,7 +112,13 @@ class ActorNode(Node):
         self.sub_ur5_status = self.create_subscription(String, self.ur5_status_topic, self._on_ur5_status, 10)
         self.sub_prompt = self.create_subscription(String, "/inference/prompt", self._on_prompt, 10)
         self.sub_cam_info = self.create_subscription(CameraInfo, "/wrist_cam/camera/color/camera_info", self._on_cam_info, 10)
-        self.sub_target_mask_arrived = self.create_subscription(Image, self.instance_mask_topic, self._on_target_mask_arrived, qos_profile_sensor_data)
+        self.sub_target_mask_arrived = self.create_subscription(
+            Image,
+            self.instance_mask_topic,
+            self._on_target_mask_arrived,
+            qos_profile_sensor_data,
+            callback_group=self.cb_group_sync_io,
+        )
 
         self._latest_tcp_R_base = np.eye(3, dtype=np.float64)
         self._latest_tcp_p_base = np.zeros(3, dtype=np.float64)
@@ -136,16 +148,33 @@ class ActorNode(Node):
         self.K: Optional[np.ndarray] = None
         self.srv_reset = self.create_service(Trigger, "/pose_tracker/reset", self._on_reset)
 
-        self.color_sub = message_filters.Subscriber(self, Image, self.color_topic, qos_profile=qos_profile_sensor_data)
-        self.depth_sub = message_filters.Subscriber(self, Image, self.depth_topic, qos_profile=qos_profile_sensor_data)
-        self.mask_sub = message_filters.Subscriber(self, Image, self.instance_mask_topic, qos_profile=qos_profile_sensor_data)
+        self._sync_slop_ns = int(max(0.0, float(self.sync_slop_sec)) * 1e9)
+        self._sync_color_buf = deque(maxlen=max(1, self.sync_queue_size))
+        self._sync_depth_buf = deque(maxlen=max(1, self.sync_queue_size))
+        self._sync_mask_buf = deque(maxlen=max(1, self.sync_queue_size))
+        self._last_synced_triplet: Optional[tuple[int, int, int]] = None
+        self._sync_buf_lock = threading.Lock()
+        self._last_sync_debug_log_ns = 0
 
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.color_sub, self.depth_sub, self.mask_sub],
-            self.sync_queue_size,
-            self.sync_slop_sec,
+        self.sub_color_sync = self.create_subscription(
+            Image,
+            self.color_topic,
+            self._on_color_sync,
+            qos_profile_sensor_data,
+            callback_group=self.cb_group_sync_io,
         )
-        self.sync.registerCallback(self._on_synced)
+        self.sub_depth_sync = self.create_subscription(
+            Image,
+            self.depth_topic,
+            self._on_depth_sync,
+            qos_profile_sensor_data,
+            callback_group=self.cb_group_sync_io,
+        )
+        self.sync_timer = self.create_timer(
+            1.0 / max(self.sync_process_hz, 1e-3),
+            self._on_sync_timer,
+            callback_group=self.cb_group_sync_timer,
+        )
         self._synced_once = False
 
         self._publish_status()
@@ -308,6 +337,83 @@ class ActorNode(Node):
 
     def _on_target_mask_arrived(self, _msg: Image):
         self._target_mask_msg_count += 1
+        self._push_sync_msg(self._sync_mask_buf, _msg)
+
+    @staticmethod
+    def _stamp_to_ns(stamp) -> int:
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    def _push_sync_msg(self, buf: deque, msg: Image):
+        ns = self._stamp_to_ns(msg.header.stamp)
+        with self._sync_buf_lock:
+            buf.append((ns, msg))
+
+    def _find_nearest_sync_msg(self, buf: deque, target_ns: int) -> Optional[tuple[int, Image]]:
+        if not buf:
+            return None
+        best = None
+        best_dt = self._sync_slop_ns + 1
+        for ns, msg in reversed(buf):
+            dt = abs(ns - target_ns)
+            if dt < best_dt:
+                best = (ns, msg)
+                best_dt = dt
+                if dt == 0:
+                    break
+        if best is None or best_dt > self._sync_slop_ns:
+            return None
+        return best
+
+    def _try_sync_and_process(self):
+        with self.lock:
+            if self.busy:
+                return
+
+        with self._sync_buf_lock:
+            if not self._sync_color_buf:
+                return
+
+            color_ns, color_msg = self._sync_color_buf[-1]
+            depth_match = self._find_nearest_sync_msg(self._sync_depth_buf, color_ns)
+            mask_match = self._find_nearest_sync_msg(self._sync_mask_buf, color_ns)
+            if depth_match is None or mask_match is None:
+                return
+
+            depth_ns, depth_msg = depth_match
+            mask_ns, mask_msg = mask_match
+            key = (color_ns, depth_ns, mask_ns)
+            if self._last_synced_triplet == key:
+                return
+            self._last_synced_triplet = key
+
+        now_ns = int(self.get_clock().now().nanoseconds)
+        if self.sync_debug and now_ns - self._last_sync_debug_log_ns > int(1.0e9):
+            self._last_sync_debug_log_ns = now_ns
+            age_color_ms = (now_ns - color_ns) / 1.0e6
+            age_depth_ms = (now_ns - depth_ns) / 1.0e6
+            age_mask_ms = (now_ns - mask_ns) / 1.0e6
+            dt_cd_ms = abs(color_ns - depth_ns) / 1.0e6
+            dt_cm_ms = abs(color_ns - mask_ns) / 1.0e6
+            self.get_logger().info(
+                f"sync_debug age_ms(c/d/m)=({age_color_ms:.1f}/{age_depth_ms:.1f}/{age_mask_ms:.1f}) "
+                f"delta_ms(c-d/c-m)=({dt_cd_ms:.1f}/{dt_cm_ms:.1f})"
+            )
+
+        t0_ns = int(self.get_clock().now().nanoseconds)
+        self._on_synced(color_msg, depth_msg, mask_msg)
+        if self.sync_debug:
+            dt_proc_ms = (int(self.get_clock().now().nanoseconds) - t0_ns) / 1.0e6
+            if dt_proc_ms > 200.0:
+                self.get_logger().warning(f"sync_debug processing slow: _on_synced took {dt_proc_ms:.1f} ms")
+
+    def _on_sync_timer(self):
+        self._try_sync_and_process()
+
+    def _on_color_sync(self, msg: Image):
+        self._push_sync_msg(self._sync_color_buf, msg)
+
+    def _on_depth_sync(self, msg: Image):
+        self._push_sync_msg(self._sync_depth_buf, msg)
 
     def _estimate_center_from_mask_depth(self, mask, depth, K):
         mask_u8 = mask.astype(np.uint8)
@@ -639,9 +745,12 @@ def main():
 
     rclpy.init()
     node = ActorNode(args=args)
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
