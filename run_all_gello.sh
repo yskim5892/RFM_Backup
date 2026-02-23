@@ -27,27 +27,15 @@ tmux new-window -t "$SESSION" -n "ur_driver"
 tmux send-keys -t "$SESSION:ur_driver" \
   "$COMMON && ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.43 launch_rviz:=false" C-m
 
-# Gello 데이터 수집 시 run_env가 접속하는 ZMQ 로봇 서버 (port 6001)
-# gello_software가 있으면 실행, 없으면 lcw 쪽에서 따로 띄워야 함
-if [ -d "$ROOT_DIR/gello_software" ]; then
-    tmux new-window -t "$SESSION" -n "gello_robot"
-    tmux send-keys -t "$SESSION:gello_robot" \
-      "cd $ROOT_DIR/gello_software && source $ROOT_DIR/.venv/bin/activate && source /opt/ros/humble/setup.bash 2>/dev/null; python experiments/launch_nodes.py --robot ur --robot_ip 192.168.0.43 --hostname 0.0.0.0 --robot-port 6001" C-m
-else
-    echo "⚠ gello_software 없음 - 로봇 서버(6001)는 lcw 쪽에서 따로 띄워야 함"
-fi
-
 tmux new-window -t "$SESSION" -n "ur5_bridge"
 tmux send-keys -t "$SESSION:ur5_bridge" \
   "$COMMON && python ur5_bridge.py --node_name ur5" C-m
 
-tmux new-window -t "$SESSION" -n "gsam"
-tmux send-keys -t "$SESSION:gsam" \
-  "$COMMON && echo 'example ros topic pub commands:' && echo \"ros2 topic pub -1 /inference/objects_to_track std_msgs/msg/String   \\\"{data: 'apple, lemon, baseball'}\\\"\" && echo \"ros2 topic pub -1 /inference/prompt std_msgs/msg/String \\\"{data: 'pick lemon'}\\\"\" && python gsam_cutie_tracker_node.py" C-m
 
-tmux new-window -t "$SESSION" -n "actor"
-tmux send-keys -t "$SESSION:actor" \
-  "$COMMON && python actor_node.py" C-m
+RFM_ROOT="$(cd "$(dirname "$0")" && pwd)"
+tmux new-window -t "$SESSION" -n "gello_robot"
+tmux send-keys  -t "$SESSION:gello_robot" \
+  "cd $RFM_ROOT/gello_software && source .venv/bin/activate && source /opt/ros/humble/setup.bash 2>/dev/null; python experiments/launch_nodes.py --robot ur --robot_ip 192.168.0.43 --hostname 0.0.0.0 --robot-port 6001" C-m
 
 tmux select-window -t "$SESSION:realsense"
 tmux attach -t "$SESSION"

@@ -28,6 +28,7 @@ from publish_static_tf import StaticTFPublisher
 from rfm.action import MoveSaved, MoveTcp
 
 import utils
+import GraspPoseSampler.grasp_sampler as grasp_sampler
 
 STATUS_READY = "READY"
 STATUS_MISSING_INPUT = "MISSING_INPUT"
@@ -38,8 +39,10 @@ STATUS_GRASPING = "GRASPING"
 
 
 class ActorNode(Node):
-    def __init__(self):
+    def __init__(self, args=None):
         super().__init__("actor")
+        self.args = args
+        self.test_mode = bool(getattr(args, "test_mode", False))
 
         self.lock = threading.Lock()
         self.busy = False
@@ -54,7 +57,7 @@ class ActorNode(Node):
 
         self.min_mask_pixels = int(self.declare_parameter("min_mask_pixels", 200).value)
         self.sync_queue_size = int(self.declare_parameter("sync_queue_size", 30).value)
-        self.sync_slop_sec = float(self.declare_parameter("sync_slop_sec", 0.06).value)
+        self.sync_slop_sec = float(self.declare_parameter("sync_slop_sec", 0.2).value)
         self.tf_lookup_timeout_sec = float(self.declare_parameter("tf_lookup_timeout_sec", 0.1).value)
         self.skip_while_moving = bool(self.declare_parameter("skip_while_moving", False).value)
 
@@ -115,9 +118,11 @@ class ActorNode(Node):
         self._move_tcp_result_cb = None
 
         self.pose_tracker = PoseTracker(self.repo_root, self.get_logger())
-        self.grasp_strategy_keys = self._load_grasp_strategy_keys(self.grasp_strategy_file)
+        self.grasp_strategy_map = self._load_grasp_strategy_map(self.grasp_strategy_file)
 
         self.grasper = Grasper(self)
+        self._sampled_grasps: list[dict] = []
+        self._use_sample_from_mesh = False
 
         self._prompt_queue: deque[str] = deque()
         self._active_prompt_obj: Optional[str] = None
@@ -148,7 +153,8 @@ class ActorNode(Node):
         self.get_logger().info(
             "ActorNode ready.\n"
             f"  Strategy file: {self.grasp_strategy_file}\n"
-            f"  Strategy keys: {sorted(self.grasp_strategy_keys)}\n"
+            f"  Strategy map: {self.grasp_strategy_map}\n"
+            f"  Test mode: {self.test_mode}\n"
             f"  Sub color: {self.color_topic}\n"
             f"  Sub depth: {self.depth_topic}\n"
             f"  Sub mask : {self.instance_mask_topic}\n"
@@ -159,22 +165,28 @@ class ActorNode(Node):
         if self.initial_prompt:
             self._on_prompt(String(data=self.initial_prompt))
 
-    def _load_grasp_strategy_keys(self, json_path: Path) -> set[str]:
+    def _load_grasp_strategy_map(self, json_path: Path) -> dict[str, str]:
         if not json_path.exists():
             self.get_logger().warning(f"grasp strategy file not found: {json_path}")
-            return set()
+            return {}
 
         try:
             data = json.loads(json_path.read_text(encoding="utf-8"))
         except Exception as e:
             self.get_logger().warning(f"failed to read grasp strategy file: {e}")
-            return set()
+            return {}
 
         if not isinstance(data, dict):
             self.get_logger().warning("grasp strategy file should be a JSON object")
-            return set()
+            return {}
 
-        return {self.pose_tracker.normalize_object_name(k) for k in data.keys()}
+        out = {}
+        for k, v in data.items():
+            key = utils.normalize_object_name(k)
+            val = str(v).strip().lower()
+            if key:
+                out[key] = val
+        return out
 
     def _on_prompt(self, msg: String):
         obj_name = utils.parse_prompt_to_object(msg.data)
@@ -191,17 +203,19 @@ class ActorNode(Node):
             return
 
         obj_name = self._prompt_queue[0]
-        norm = self.pose_tracker.normalize_object_name(obj_name)
-        has_strategy = norm in self.grasp_strategy_keys
-        has_mesh = self.pose_tracker.mesh_exists(obj_name)
+        norm = utils.normalize_object_name(obj_name)
+        strategy = self.grasp_strategy_map.get(norm, None)
+        has_mesh = utils.find_mesh_file(obj_name) is not None
 
-        use_fp = has_strategy and has_mesh
-        if use_fp:
-            try:
-                use_fp = self.pose_tracker.set_object(obj_name)
-            except Exception as e:
-                self.get_logger().warning(f"FoundationPose object setup failed. fallback to mask+depth: {e}")
-                use_fp = False
+        use_sample_from_mesh = has_mesh and (strategy is None or strategy == "sample_from_mesh")
+        self._sampled_grasps = []
+        self._use_sample_from_mesh = False
+        use_fp = False
+
+        if use_sample_from_mesh:
+            self._sampled_grasps = grasp_sampler.load_topk_grasps(obj_name, 100)
+            use_fp = bool(self._sampled_grasps) and self.pose_tracker.set_object(obj_name)
+            self._use_sample_from_mesh = use_fp
 
         if not use_fp:
             self.pose_tracker.clear_object()
@@ -213,9 +227,10 @@ class ActorNode(Node):
         self._move_tcp_result_cb = None
         self._active_prompt_obj = obj_name
 
-        mode = "FoundationPose" if self._use_foundation_pose else "MaskDepth"
+        mode = "SampleFromMesh" if self._use_sample_from_mesh else "MaskDepth"
         self.get_logger().info(
-            f"Prompt activated: object='{norm}', strategy={has_strategy}, mesh={has_mesh}, mode={mode}"
+            f"Prompt activated: object='{norm}', strategy={strategy}, mesh={has_mesh}, "
+            f"mode={mode}, grasps={len(self._sampled_grasps)}"
         )
         self._set_status(STATUS_PROMPTED)
 
@@ -343,6 +358,8 @@ class ActorNode(Node):
             return
 
         self._publish_pose(self.pub_target_tcp, self.base_frame, stamp, target_tcp)
+        if self.test_mode:
+            return
         if self.send_move_tcp_goal(target_tcp, stamp, result_cb=self._on_approach_done):
             self._set_status(STATUS_APPROACHING)
 
@@ -361,6 +378,8 @@ class ActorNode(Node):
         topic_pub.publish(utils.make_pose_msg(frame_id, stamp, T))
 
     def send_move_tcp_goal(self, T_base_tcp: np.ndarray, stamp, result_cb=None) -> bool:
+        if self.test_mode:
+            return False
         if self._update_warn(
             not self.act_move_tcp.wait_for_server(timeout_sec=self.ur5_action_wait_timeout),
             "move_tcp_server_unavailable",
@@ -557,21 +576,17 @@ class ActorNode(Node):
             if self.current_status == STATUS_MISSING_INPUT:
                 self._set_status(STATUS_PROMPTED)
 
-            p_obj_cam, z_mean, center_dist_px, centroid_uv = self._estimate_center_from_mask_depth(mask, depth, K)
-            if self._update_warn(p_obj_cam is None, "mask_depth_invalid", "Mask/depth center estimation failed"):
+            p_cam_obj_from_mask, z_mean, center_dist_px, centroid_uv = self._estimate_center_from_mask_depth(mask, depth, K)
+            if self._update_warn(p_cam_obj_from_mask is None, "mask_depth_invalid", "Mask/depth center estimation failed"):
                 self._set_status(STATUS_MISSING_INPUT)
                 return
 
-            p_obj_base = (T_base_cam[:3, :3] @ p_obj_cam) + T_base_cam[:3, 3]
-            vis_base = self._make_base_pose_overlay(rgb, mask, K, p_obj_cam, centroid_uv)
+            vis_base = self._make_base_pose_overlay(rgb, mask, K, p_cam_obj_from_mask, centroid_uv)
             vis = vis_base
             target_tcp = None
 
             if self._use_foundation_pose:
                 T_cam_obj = self.pose_tracker.track_pose(K, rgb, depth, mask)
-                if self._update_warn(T_cam_obj is None, "register_failed", "FoundationPose could not register target"):
-                    self._set_status(STATUS_MISSING_INPUT)
-                    return
 
                 bad = self.pose_tracker.check_pose_valid(T_cam_obj, K, centroid_uv, z_mean)
                 self._update_warn(bad, "tracking_unhealthy", "Tracking unhealthy, re-registering next frame")
@@ -587,10 +602,7 @@ class ActorNode(Node):
                 if should_compute_target:
                     target_tcp, x_axis_base = self.pose_tracker.compute_target_tcp_T(
                         T_base_obj=T_base_obj,
-                        mask=mask,
-                        K=K,
-                        T_base_cam=T_base_cam,
-                        z_ref_m=z_mean,
+                        grasp_records=self._sampled_grasps,
                         latest_tcp_R_base=self._latest_tcp_R_base,
                         latest_tcp_p_base=self._latest_tcp_p_base,
                         pregrasp_height=self.pregrasp_height,
@@ -602,7 +614,8 @@ class ActorNode(Node):
 
                 vis = self.pose_tracker.overlay_pose_axes_and_center(vis_base, K, T_cam_obj, x_axis_cam)
             else:
-                target_tcp = self._compute_target_tcp_from_point(p_obj_base)
+                p_base_obj = (T_base_cam[:3, :3] @ p_cam_obj_from_mask) + T_base_cam[:3, 3]
+                target_tcp = self._compute_target_tcp_from_point(p_base_obj)
 
             if target_tcp is not None:
                 self._run_grasp_control(z_mean, center_dist_px, target_tcp, color_msg.header.stamp)
@@ -619,8 +632,13 @@ class ActorNode(Node):
                 self.busy = False
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test_mode", action="store_true", help="do not command UR5 or gripper")
+    args, _ = parser.parse_known_args()
+
     rclpy.init()
-    node = ActorNode()
+    node = ActorNode(args=args)
     try:
         rclpy.spin(node)
     finally:

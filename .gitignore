@@ -1,5 +1,6 @@
 _backup_thirdparty
 ycb/
+GraspPoseSampler/grasps
 __pycache__/
 *.pyc
 .vscode/
@@ -8,3 +9,4 @@ rfm/build*
 rfm/log*
 rfm/weights
 log/
+

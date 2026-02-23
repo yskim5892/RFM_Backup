@@ -2,6 +2,7 @@ import ast
 import json
 import cv2
 import numpy as np
+from pathlib import Path
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from math_utils import mat_to_quat, quat_to_mat, tf_to_T
 from sensor_msgs.msg import Image
@@ -145,6 +146,24 @@ def parse_objects_to_track(raw_text: str) -> list[str]:
 def normalize_object_name(text: str) -> str:
     return (text or "").strip().lower().replace(" ", "_")
 
+def find_mesh_file(object_name: str) -> Optional[Path]:
+    root = Path(__file__).resolve().parent
+    norm = normalize_object_name(object_name)
+    if not norm:
+        return None
+
+    ycb_root = root / "ycb"
+    if not ycb_root.exists():
+        return None
+
+    matches = sorted(p for p in ycb_root.glob(f"*{norm}*") if p.is_dir())
+    if not matches:
+        return None
+
+    mesh_file = matches[0] / "google_16k" / "textured.obj"
+    if not mesh_file.exists():
+        return None
+    return mesh_file
 
 def publish_rgb8_image(pub, header, rgb: np.ndarray):
     if rgb is None:

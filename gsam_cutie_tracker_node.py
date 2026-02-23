@@ -349,6 +349,8 @@ class GSAMCutieTracker(Node):
         # initialized되지 않았으면 gsam으로 초기 마스크 1회 생성, 이후 프레임부터는 Cutie로 추적
         with torch.cuda.amp.autocast(enabled=amp):
             if not self.inited:
+                if len(self.objects_to_track) == 0:
+                    return
                 init_mask = np.zeros(rgb.shape[:2], dtype=np.int32)
                 next_id = 1
                 instance_objects = [""]
@@ -443,7 +445,7 @@ def main():
     parser.add_argument("--topk", type=int, default=1, help="DINO topk initial box")
     parser.add_argument("--score_th", type=float, default=0.0, help="min DINO logit to keep (absolute)")
     parser.add_argument("--rel_score_th", type=float, default=0.85, help="keep boxes with score >= best*rel_score_th (0 disables)")
-    args, _ = parser.parse_known_args()    
+    args, _ = parser.parse_known_args()
 
     rclpy.init()
     node = GSAMCutieTracker(args)

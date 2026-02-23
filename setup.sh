@@ -60,6 +60,9 @@ echo "[INFO] Installing Python dependencies"
 python -m pip install wheel
 python -m pip install -r "${REPO_ROOT}/requirements.txt"
 
+echo "[INFO] Installing Warp"
+VENV_PATH="${VENV_PATH}" bash "${REPO_ROOT}/scripts/install_warp.sh"
+
 echo "[INFO] Building mycpp (pybind extension)"
 cd "${FP_DIR}/mycpp"
 if [[ -d "build" ]]; then

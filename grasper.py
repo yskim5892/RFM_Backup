@@ -18,6 +18,7 @@ MOVE_SAVED_WAIT_TIMEOUT = 0.05
 class Grasper:
     def __init__(self, node):
         self.node = node
+        self.test_mode = bool(getattr(self.node, "test_mode", False))
         self.bridge_prefix = getattr(self.node, "bridge_prefix", "/ur5")
         self.speed = 255
         self.force = 255
@@ -27,6 +28,9 @@ class Grasper:
         self._grasp_last_target_tcp: Optional[np.ndarray] = None
 
         self.gripper: Optional[RobotiqGripper] = None
+        if self.test_mode:
+            self.node.get_logger().info("Grasper running in test_mode: gripper/UR5 commands are disabled.")
+            return
         try:
             self.gripper = RobotiqGripper(
                 host=GRIPPER_HOST,
@@ -54,6 +58,13 @@ class Grasper:
         self.node._set_status(STATUS_PROMPTED)
 
     def start_sequence(self, R, p):
+        if self.test_mode:
+            self.node.get_logger().info("test_mode: skip grasp sequence")
+            self._grasp_last_target_tcp = None
+            self.node._set_status(STATUS_READY)
+            self.node.on_prompt_succeeded()
+            return
+
         z_axis_base = R[:, 2]
         z_axis_base = z_axis_base / (np.linalg.norm(z_axis_base) + 1e-12)
         p_approach = p + z_axis_base * self.approach_distance
